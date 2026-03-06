@@ -6,6 +6,43 @@
 
 ---
 
+## Agent Framework: OpenClaw
+
+Vera runs on [OpenClaw](https://openclaw.ai) — an open-source autonomous agent runtime.
+OpenClaw provides:
+- Persistent memory and identity (loaded from SOUL.md)
+- Skills system (5 custom skills in skills/ folder)
+- Telegram/Discord integration for conversational querying
+- Built-in heartbeat/cron for weekly automation
+
+### Install OpenClaw
+```bash
+npm i -g openclaw
+openclaw onboard
+```
+
+### Register Vera's Skills
+```bash
+openclaw skills add ./skills/scrape-reviews.js
+openclaw skills add ./skills/process-nlp.js
+openclaw skills add ./skills/query-database.js
+openclaw skills add ./skills/get-statistics.js
+openclaw skills add ./skills/generate-report.js
+```
+
+### Connect Telegram
+Add `TELEGRAM_BOT_TOKEN` to `.env` (get from @BotFather)
+```bash
+openclaw integrations add telegram --token $TELEGRAM_BOT_TOKEN
+```
+
+### Start Vera
+```bash
+openclaw start --config ./openclaw-config.json
+```
+
+---
+
 ## Architecture
 
 ```
