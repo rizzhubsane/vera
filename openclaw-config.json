@@ -1,0 +1,26 @@
+{
+  "agent": {
+    "name": "Vera",
+    "soulFile": "./agent/SOUL.md"
+  },
+  "llm": {
+    "provider": "openai-compatible",
+    "baseUrl": "https://api.groq.com/openai/v1",
+    "model": "llama-3.3-70b-versatile",
+    "apiKey": "${GROQ_API_KEY}"
+  },
+  "skills": [
+    "./skills/scrape-reviews.js",
+    "./skills/process-nlp.js",
+    "./skills/query-database.js",
+    "./skills/get-statistics.js",
+    "./skills/generate-report.js"
+  ],
+  "heartbeats": [
+    {
+      "id": "weekly-voc-run",
+      "cron": "0 9 * * 1",
+      "message": "Run the weekly VoC pipeline: 1) scrape new reviews for both products using weekly_delta mode, 2) process NLP on all new reviews, 3) generate the weekly delta report, 4) summarize what changed this week and flag any complaint spikes above 20%."
+    }
+  ]
+}

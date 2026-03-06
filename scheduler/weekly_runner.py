@@ -24,6 +24,22 @@ load_dotenv()
 console = Console()
 
 
+def send_telegram_notification(message):
+    import requests
+    token = os.getenv('TELEGRAM_BOT_TOKEN')
+    chat_id = os.getenv('TELEGRAM_CHAT_ID')
+    if token and chat_id:
+        try:
+            requests.post(
+                f'https://api.telegram.org/bot{token}/sendMessage',
+                json={'chat_id': chat_id, 'text': message, 'parse_mode': 'Markdown'},
+                timeout=10
+            )
+            print('Telegram notification sent.')
+        except Exception as e:
+            print(f'Telegram notification failed: {e}')
+
+
 def weekly_job():
     """Execute the full weekly VoC pipeline via the agent."""
     from agent.voc_agent import run_agent
@@ -37,6 +53,12 @@ def weekly_job():
     )
     console.print(result)
     console.print(f"[bold yellow]=== WEEKLY VoC RUN COMPLETE: {datetime.utcnow()} ===[/bold yellow]\n")
+    send_telegram_notification(
+        f"✅ *Vera Weekly VoC Run Complete*\n"
+        f"📅 {datetime.utcnow().strftime('%Y-%m-%d %H:%M UTC')}\n"
+        f"📊 Reports saved to reports/\n"
+        f"See reports/weekly_delta_report.md for this week's action items."
+    )
 
 
 if __name__ == "__main__":
