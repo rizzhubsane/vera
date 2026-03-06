@@ -10,7 +10,7 @@ and Support teams based on the review database.
 import os
 import json
 from datetime import datetime, timezone
-
+from groq import Groq
 from rich.console import Console
 from rich.markdown import Markdown
 
@@ -30,71 +30,56 @@ os.makedirs(REPORTS_DIR, exist_ok=True)
 
 
 def generate_global_action_report(product_a_id, product_b_id):
-    """Generate a comprehensive action-item report for all teams.
-
-    Analyzes sentiment and theme data across both products and produces
-    a markdown report with recommendations for Product, Marketing,
-    and Support teams.
-
-    Args:
-        product_a_id: Identifier for product A.
-        product_b_id: Identifier for product B.
-
-    Returns:
-        The full markdown report as a string. Also saves to reports/ folder.
-    """
+    """Generate a comprehensive action-item report for all teams using Groq."""
     insights_a = get_theme_insights(product_a_id)
     insights_b = get_theme_insights(product_b_id)
     insights_all = get_theme_insights()
 
     timestamp = datetime.now(timezone.utc).strftime("%Y-%m-%d_%H%M%S")
+    
+    # Collect raw data as JSON to inject into prompt
+    db_data = json.dumps({
+        "all_product_insights": insights_all,
+        "product_a_insights": insights_a,
+        "product_b_insights": insights_b
+    }, indent=2)
 
-    report = f"""# VOC Global Action Report
-**Generated:** {timestamp}
+    prompt = f"""
+CRITICAL REQUIREMENTS FOR EVERY ACTION ITEM:
+1. Must name the specific theme it relates to (e.g., ANC, Battery Life, Build Quality)
+2. Must cite the exact review count: e.g., '67 of 243 reviews (28%) rate this Negative'
+3. Must give one concrete recommendation, not vague advice
+4. Bad example: 'Improve sound quality' 
+5. Good example: 'Sound Quality [Product Team]: 89 of 312 Master Buds 1 reviews (29%) cite distortion at high volumes. Recommend hardware review of driver tuning — 34 reviews specifically mention crackling above 70% volume.'
+Apply this format to every single action item across all three teams.
 
----
-
-## Overall Summary
-- **Total reviews in DB:** {insights_all['total_reviews']}
-- **Product A ({product_a_id}):** {insights_a['total_reviews']} reviews
-- **Product B ({product_b_id}):** {insights_b['total_reviews']} reviews
-
-## Sentiment Overview
-
-| Metric | Product A | Product B |
-|--------|-----------|-----------|
-| Positive | {insights_a['sentiment_breakdown']['Positive']} | {insights_b['sentiment_breakdown']['Positive']} |
-| Negative | {insights_a['sentiment_breakdown']['Negative']} | {insights_b['sentiment_breakdown']['Negative']} |
-| Neutral | {insights_a['sentiment_breakdown']['Neutral']} | {insights_b['sentiment_breakdown']['Neutral']} |
-
-## Theme Frequency (All Products)
-
-"""
-    for theme, count in insights_all.get("theme_frequency", {}).items():
-        report += f"- **{theme}**: {count} mentions\n"
-
-    report += f"""
+You are Vera, a Senior Consumer Insights Analyst. 
+Write a Global Action Report based ONLY on the following JSON SQLite database export.
+The report must include these markdown sections:
+# VOC Global Action Report
+## Executive Summary
 ## 🔧 Product Team Actions
-- **Top negative themes (Product A):** {', '.join(insights_a.get('top_negative_themes', ['N/A']))}
-- **Top negative themes (Product B):** {', '.join(insights_b.get('top_negative_themes', ['N/A']))}
-- Investigate reviews tagged with the above themes for hardware/feature issues.
-
 ## 📣 Marketing Team Actions
-- **Top positive themes (Product A):** {', '.join(insights_a.get('top_positive_themes', ['N/A']))}
-- **Top positive themes (Product B):** {', '.join(insights_b.get('top_positive_themes', ['N/A']))}
-- Leverage these themes in messaging and campaigns.
-
 ## 🎧 Support Team Actions
-- Review the most frequent negative themes for FAQ and troubleshooting updates.
-- Prioritize themes with highest negative counts across both products.
 
----
-*Report saved to reports/ folder.*
+Here is the database export:
+{db_data}
 """
 
-    # Save to file
-    filename = f"global_report_{timestamp}.md"
-    filepath = os.path.join(REPORTS_DIR, filename)
+    client = Groq()
+    response = client.chat.completions.create(
+        model="llama-3.3-70b-versatile",
+        messages=[{"role": "user", "content": prompt}],
+        temperature=0.2,
+        max_tokens=4000
+    )
+    
+    report_content = response.choices[0].message.content
+    
+    report = f"{report_content}\n\n---\n*Report generated on {timestamp}*\n*Full report saved to reports/global_action_report.md*"
+
+    # Save to file (PRD explicitly requires this exact filename for the final run)
+    filepath = os.path.join(REPORTS_DIR, "global_action_report.md")
     with open(filepath, "w") as f:
         f.write(report)
 
@@ -102,19 +87,7 @@ def generate_global_action_report(product_a_id, product_b_id):
 
 
 def generate_weekly_delta_report(product_a_id, product_b_id, since_date=None):
-    """Generate a delta report for reviews added since a given date.
-
-    Focuses on new reviews only, highlighting emerging themes and
-    sentiment shifts.
-
-    Args:
-        product_a_id: Identifier for product A.
-        product_b_id: Identifier for product B.
-        since_date: ISO date string to filter from. Defaults to last 7 days.
-
-    Returns:
-        The markdown delta report as a string. Also saves to reports/ folder.
-    """
+    """Generate a delta report for reviews added since a given date using Groq."""
     if not since_date:
         from datetime import timedelta
         since_date = (datetime.now(timezone.utc) - timedelta(days=7)).isoformat()
@@ -123,40 +96,49 @@ def generate_weekly_delta_report(product_a_id, product_b_id, since_date=None):
     new_b = get_reviews_since(since_date, product_b_id)
 
     timestamp = datetime.now(timezone.utc).strftime("%Y-%m-%d_%H%M%S")
+    
+    # Collect raw data as JSON to inject into prompt
+    db_data = json.dumps({
+        "product_a_new_reviews": new_a,
+        "product_b_new_reviews": new_b,
+        "total_new_reviews": len(new_a) + len(new_b)
+    }, indent=2)
 
-    report = f"""# VOC Weekly Delta Report
-**Generated:** {timestamp}
-**Since:** {since_date}
+    prompt = f"""
+CRITICAL REQUIREMENTS FOR EVERY ACTION ITEM:
+1. Must name the specific theme it relates to (e.g., ANC, Battery Life, Build Quality)
+2. Must cite the exact review count: e.g., '67 of 243 reviews (28%) rate this Negative'
+3. Must give one concrete recommendation, not vague advice
+4. Bad example: 'Improve sound quality' 
+5. Good example: 'Sound Quality [Product Team]: 89 of 312 Master Buds 1 reviews (29%) cite distortion at high volumes. Recommend hardware review of driver tuning — 34 reviews specifically mention crackling above 70% volume.'
+Apply this format to every single action item across all three teams.
 
----
+You are Vera, a Senior Consumer Insights Analyst. 
+Write a Weekly Delta Report based ONLY on the following JSON SQLite database export of NEW reviews since {since_date}.
+The report must include these markdown sections:
+# VOC Weekly Delta Report
+## Emerging Themes (New This Week)
+## 🔧 Product Team Actions
+## 📣 Marketing Team Actions
+## 🎧 Support Team Actions
 
-## New Reviews This Period
-- **Product A ({product_a_id}):** {len(new_a)} new reviews
-- **Product B ({product_b_id}):** {len(new_b)} new reviews
-- **Total new:** {len(new_a) + len(new_b)}
-
-## Sentiment of New Reviews
-
-### Product A
-"""
-    # Count sentiments for new reviews
-    for product_label, new_reviews in [("A", new_a), ("B", new_b)]:
-        pos = sum(1 for r in new_reviews if r.get("sentiment") == "Positive")
-        neg = sum(1 for r in new_reviews if r.get("sentiment") == "Negative")
-        neu = sum(1 for r in new_reviews if r.get("sentiment") == "Neutral")
-        report += f"- Positive: {pos} | Negative: {neg} | Neutral: {neu}\n"
-        if product_label == "A":
-            report += f"\n### Product B\n"
-
-    report += f"""
-## Emerging Themes
-*Review new reviews for any emerging patterns not seen in previous periods.*
-
----
-*Delta report saved to reports/ folder.*
+Here is the database export of new reviews:
+{db_data}
 """
 
-    filename = f"weekly_delta_{timestamp}.md"
+    client = Groq()
+    response = client.chat.completions.create(
+        model="llama-3.3-70b-versatile",
+        messages=[{"role": "user", "content": prompt}],
+        temperature=0.2,
+        max_tokens=4000
+    )
+    
+    report_content = response.choices[0].message.content
+    
+    report = f"{report_content}\n\n---\n*Report generated on {timestamp}*\n*Full report saved to reports/weekly_delta_report.md*"
+
+    filename = "weekly_delta_report.md"
     filepath = os.path.join(REPORTS_DIR, filename)
     with open(filepath, "w") as f:
         f.write(report)

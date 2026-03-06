@@ -257,8 +257,8 @@ def scrape_flipkart_reviews(product_url, product_id, product_name, max_pages=10)
             soup = BeautifulSoup(html, "html.parser")
 
             # Flipkart's new React Native web DOM uses heavily obfuscated classes like css-175oi2r
-            # The most reliable way to find reviews is to look for the "1" to "5" star rating divs.
-            rating_els = soup.find_all("div", string=re.compile(r"^[1-5]$"))
+            # Ratings can be "5" or "5.0"
+            rating_els = soup.find_all("div", string=re.compile(r"^[1-5](\.0)?$"))
             
             if not rating_els:
                 console.print(f"  [yellow]No reviews found on page {page}. Stopping.[/]")
@@ -282,26 +282,38 @@ def scrape_flipkart_reviews(product_url, product_id, product_name, max_pages=10)
                     processed_containers.add(id(container))
                     texts = list(container.stripped_strings)
                     
-                    # Pattern usually: [Rating, Title, Date, Body, ..., Name, 'Verified Buyer']
-                    rating = _extract_rating(texts[0])
-                    title = texts[1]
+                    # Pattern usually: ['5.0', '•', 'Title', 'Review for:...', 'Body', 'more', 'Name']
+                    raw_rating = texts[0]
+                    rating = _extract_rating(raw_rating)
                     
-                    # Sometimes "more" is in the middle
+                    # Find title (often the first or second string after rating, skipping bullets)
+                    title = ""
+                    body_start_idx = 1
+                    for i in range(1, min(4, len(texts))):
+                        if texts[i] not in ("•", "★") and not texts[i].startswith("Review for"):
+                            title = texts[i]
+                            body_start_idx = i + 1
+                            break
+                    
+                    # Find body and date
                     body_parts = []
                     review_date = ""
-                    for t in texts[2:]:
+                    
+                    for t in texts[body_start_idx:]:
+                        if t.startswith("Review for:"):
+                            continue
                         if "ago" in t or re.search(r"\d{4}", t):
                             review_date = _parse_flipkart_date(t)
-                        elif t not in ("more", "Verified Buyer") and len(t) > 3 and not re.search(r"^\d+$", t):
+                        elif t not in ("more", "Verified Buyer", "Verified Purchase", "Helpful for") and len(t) > 3 and not re.search(r"^\d+$", t):
                             body_parts.append(t)
                             
-                    body = " ".join(body_parts[:2]) # usually the first long texts are the body
+                    body = " ".join(body_parts[:2]).strip()
                     
                     if body and rating:
                         all_reviews.append({
                             "product_id": product_id,
                             "product_name": product_name,
-                            "review_title": title,
+                            "review_title": title[:100],
                             "review_text": body[:500],
                             "rating": rating,
                             "review_date": review_date,
@@ -452,6 +464,7 @@ def run_full_scrape(
     product_b_id,
     product_b_name,
     platform="amazon",
+    max_pages=10,
 ):
     """Run a complete scraping session for two products.
 
@@ -482,7 +495,7 @@ def run_full_scrape(
     ) as progress:
         # --- Product A ---
         task_a = progress.add_task(f"Scraping {product_a_name}...", total=None)
-        reviews_a = scrape_fn(product_a_url, product_a_id, product_a_name)
+        reviews_a = scrape_fn(product_a_url, product_a_id, product_a_name, max_pages=max_pages)
         if not reviews_a:
             console.print(f"  [yellow]ScraperAPI failed. Trying Playwright fallback...[/]")
             reviews_a = scrape_with_playwright_fallback(product_a_url, product_a_id, product_a_name, platform)
@@ -494,7 +507,7 @@ def run_full_scrape(
 
         # --- Product B ---
         task_b = progress.add_task(f"Scraping {product_b_name}...", total=None)
-        reviews_b = scrape_fn(product_b_url, product_b_id, product_b_name)
+        reviews_b = scrape_fn(product_b_url, product_b_id, product_b_name, max_pages=max_pages)
         if not reviews_b:
             console.print(f"  [yellow]ScraperAPI failed. Trying Playwright fallback...[/]")
             reviews_b = scrape_with_playwright_fallback(product_b_url, product_b_id, product_b_name, platform)
@@ -524,6 +537,7 @@ def run_weekly_delta_scrape(
     product_b_id,
     product_b_name,
     platform="amazon",
+    max_pages=10,
 ):
     """Run a weekly delta scrape for two products.
 
@@ -554,7 +568,7 @@ def run_weekly_delta_scrape(
     ) as progress:
         # --- Product A ---
         task_a = progress.add_task(f"Delta scrape: {product_a_name}...", total=None)
-        reviews_a = scrape_fn(product_a_url, product_a_id, product_a_name)
+        reviews_a = scrape_fn(product_a_url, product_a_id, product_a_name, max_pages=max_pages)
         result_a = bulk_insert_reviews(reviews_a)
         total_a = get_review_count(product_a_id)
         log_scrape_run(product_a_id, result_a["inserted"], total_a, notes="weekly_delta")
@@ -563,7 +577,7 @@ def run_weekly_delta_scrape(
 
         # --- Product B ---
         task_b = progress.add_task(f"Delta scrape: {product_b_name}...", total=None)
-        reviews_b = scrape_fn(product_b_url, product_b_id, product_b_name)
+        reviews_b = scrape_fn(product_b_url, product_b_id, product_b_name, max_pages=max_pages)
         result_b = bulk_insert_reviews(reviews_b)
         total_b = get_review_count(product_b_id)
         log_scrape_run(product_b_id, result_b["inserted"], total_b, notes="weekly_delta")
