@@ -6,6 +6,9 @@ Amazon and Flipkart. Uses a two-tier strategy:
   1. Primary: ScraperAPI (proxy) + BeautifulSoup (parsing)
   2. Fallback: Playwright headless Chromium for JS-rendered pages
 
+Supports multiple base URLs per product (loaded from numbered env vars)
+and automatic sort-variant expansion, maximizing unique review coverage.
+
 All scraped reviews are returned as lists of dicts ready for
 bulk_insert_reviews() in database.py.
 """
@@ -17,7 +20,7 @@ import random
 import asyncio
 import logging
 from datetime import datetime, timezone
-from urllib.parse import quote_plus
+from urllib.parse import quote_plus, urlparse, parse_qs, urlencode, urlunparse
 
 import requests
 from bs4 import BeautifulSoup
@@ -39,13 +42,147 @@ from agent.tools.database import (
 load_dotenv()
 
 SCRAPER_API_KEY = os.getenv("SCRAPER_API_KEY", "")
-PRODUCT_A_URL = os.getenv("PRODUCT_A_URL", "")
-PRODUCT_B_URL = os.getenv("PRODUCT_B_URL", "")
 PRODUCT_A_NAME = os.getenv("PRODUCT_A_NAME", "Product A")
 PRODUCT_B_NAME = os.getenv("PRODUCT_B_NAME", "Product B")
 
 console = Console()
 logger = logging.getLogger(__name__)
+
+# The 4 sort variants that are programmatically appended to every base URL.
+SORT_VARIANTS = ["MOST_HELPFUL", "POSITIVE_FIRST", "NEGATIVE_FIRST", "RECENT"]
+
+# ---------------------------------------------------------------------------
+# URL Loading & Variant Generation (Parts A, B, C, D)
+# ---------------------------------------------------------------------------
+
+
+def load_product_urls(prefix: str) -> list[str]:
+    """Load product URLs from numbered env vars.
+
+    Reads {prefix}_URL_1 through {prefix}_URL_10 and stops at the first
+    empty slot. Falls back to the legacy single-var {prefix}_URL if no
+    numbered vars are found, so existing .env files keep working.
+
+    Args:
+        prefix: Environment variable prefix, e.g. "PRODUCT_A" or "PRODUCT_B".
+
+    Returns:
+        A list of non-empty URL strings (may be empty if nothing is set).
+    """
+    urls = []
+    for i in range(1, 11):
+        url = os.getenv(f"{prefix}_URL_{i}", "").strip()
+        if not url:
+            break
+        urls.append(url)
+
+    # Backward compatibility: fall back to the single PRODUCT_A_URL / PRODUCT_B_URL
+    if not urls:
+        legacy_url = os.getenv(f"{prefix}_URL", "").strip()
+        if legacy_url:
+            urls.append(legacy_url)
+
+    return urls
+
+
+def _normalize_url_for_dedup(url: str) -> str:
+    """Strip sort, page, and pageNumber query params for dedup comparison.
+
+    Two URLs that differ only in sort/page params are considered duplicates
+    because the scraper will paginate and sort-vary them independently.
+
+    Args:
+        url: A full URL string.
+
+    Returns:
+        The URL with sort/page/pageNumber params removed, lowercased.
+    """
+    parsed = urlparse(url)
+    params = parse_qs(parsed.query, keep_blank_values=True)
+    # Remove params we control programmatically
+    for key in ("sort", "page", "pageNumber"):
+        params.pop(key, None)
+    cleaned_query = urlencode(params, doseq=True)
+    cleaned = urlunparse((
+        parsed.scheme,
+        parsed.netloc.lower(),
+        parsed.path,
+        parsed.params,
+        cleaned_query,
+        "",  # drop fragment
+    ))
+    return cleaned
+
+
+def _generate_sort_variant_urls(base_urls: list[str]) -> list[str]:
+    """Generate sort-variant URLs from a list of base URLs.
+
+    For each base URL, produces len(SORT_VARIANTS) variants by appending
+    or replacing the &sort= query parameter. The final list is deduplicated
+    (after normalizing away sort/page params) to avoid redundant HTTP calls.
+
+    Args:
+        base_urls: List of base URLs to expand.
+
+    Returns:
+        A deduplicated list of URLs with sort variants applied.
+    """
+    variant_urls = []
+    for base_url in base_urls:
+        for sort_key in SORT_VARIANTS:
+            parsed = urlparse(base_url)
+            params = parse_qs(parsed.query, keep_blank_values=True)
+            params["sort"] = [sort_key]
+            new_query = urlencode(params, doseq=True)
+            variant_url = urlunparse((
+                parsed.scheme,
+                parsed.netloc,
+                parsed.path,
+                parsed.params,
+                new_query,
+                "",
+            ))
+            variant_urls.append(variant_url)
+
+    # Deduplicate: keep the first occurrence for each normalized form
+    seen = set()
+    unique_urls = []
+    for url in variant_urls:
+        norm = _normalize_url_for_dedup(url)
+        if norm not in seen:
+            seen.add(norm)
+            unique_urls.append(url)
+
+    return unique_urls
+
+
+def _print_scrape_plan(
+    product_name: str,
+    base_urls: list[str],
+    final_urls: list[str],
+    max_pages: int,
+) -> None:
+    """Print a summary of the scrape plan before execution (Part E).
+
+    Example output:
+        Scraping Product A using 6 URLs × 4 sort variants × 25 pages
+        = 600 URL attempts (24 unique after dedup)
+    """
+    raw_count = len(base_urls) * len(SORT_VARIANTS)
+    total_attempts = len(final_urls) * max_pages
+    console.print(
+        f"\n[bold cyan]Scraping {product_name} using "
+        f"{len(base_urls)} URL{'s' if len(base_urls) != 1 else ''} × "
+        f"{len(SORT_VARIANTS)} sort variants × "
+        f"{max_pages} pages "
+        f"= {total_attempts} URL attempts"
+        f" ({len(final_urls)} unique URLs after dedup)[/]"
+    )
+    if raw_count != len(final_urls):
+        console.print(
+            f"  [dim]({raw_count - len(final_urls)} duplicate variant URLs removed)[/]"
+        )
+
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -452,39 +589,117 @@ def scrape_with_playwright_fallback(product_url, product_id, product_name, platf
 
 
 # ---------------------------------------------------------------------------
-# 4. Full Scrape Orchestrator
+# 4. Multi-URL Single Product Scraper
+# ---------------------------------------------------------------------------
+
+
+def _scrape_single_product(
+    urls: list[str],
+    product_id: str,
+    product_name: str,
+    platform: str,
+    max_pages: int = 25,
+) -> list[dict]:
+    """Scrape a single product across multiple URLs with sort variants.
+
+    This is the core orchestrator that:
+    1. Generates sort variants from the base URLs.
+    2. Deduplicates the URL list.
+    3. Logs the scrape plan.
+    4. Iterates each URL through the platform-specific scraper.
+    5. Falls back to Playwright if the total haul is zero.
+
+    Args:
+        urls: Base URLs loaded from env for this product.
+        product_id: Identifier like 'product_a'.
+        product_name: Human-readable product name.
+        platform: 'amazon' or 'flipkart'.
+        max_pages: Pages to scrape per URL (default 25).
+
+    Returns:
+        A flat list of review dicts (may contain in-memory duplicates;
+        the database UNIQUE constraint handles final dedup on insert).
+    """
+    if not urls:
+        console.print(f"[red]No URLs configured for {product_name}. Skipping.[/]")
+        return []
+
+    # Generate sort-variant URLs and deduplicate
+    final_urls = _generate_sort_variant_urls(urls)
+
+    # Part E — log the plan
+    _print_scrape_plan(product_name, urls, final_urls, max_pages)
+
+    scrape_fn = scrape_amazon_reviews if platform == "amazon" else scrape_flipkart_reviews
+    all_reviews = []
+
+    for idx, url in enumerate(final_urls, 1):
+        console.print(
+            f"\n[bold yellow]  [{idx}/{len(final_urls)}] Variant URL:[/] "
+            f"[dim]{url[:120]}{'...' if len(url) > 120 else ''}[/]"
+        )
+        try:
+            reviews = scrape_fn(url, product_id, product_name, max_pages=max_pages)
+            all_reviews.extend(reviews)
+            console.print(
+                f"  [green]→ Got {len(reviews)} reviews "
+                f"(running total: {len(all_reviews)})[/]"
+            )
+        except Exception as e:
+            logger.error("Failed scraping URL %s: %s", url, e)
+            console.print(f"  [red]Error: {e}[/]")
+
+        # Small delay between variant URLs to be polite
+        if idx < len(final_urls):
+            time.sleep(random.uniform(1, 2))
+
+    # Playwright fallback if we got nothing at all
+    if not all_reviews and urls:
+        console.print(f"[yellow]All ScraperAPI attempts failed for {product_name}. "
+                       f"Trying Playwright fallback on first URL...[/]")
+        all_reviews = scrape_with_playwright_fallback(
+            urls[0], product_id, product_name, platform
+        )
+
+    console.print(
+        f"\n[bold green]Total scraped for {product_name}: "
+        f"{len(all_reviews)} reviews (pre-DB-dedup)[/]"
+    )
+    return all_reviews
+
+
+# ---------------------------------------------------------------------------
+# 5. Full Scrape Orchestrator
 # ---------------------------------------------------------------------------
 
 
 def run_full_scrape(
-    product_a_url,
     product_a_id,
     product_a_name,
-    product_b_url,
     product_b_id,
     product_b_name,
     platform="amazon",
-    max_pages=10,
+    max_pages=25,
 ):
     """Run a complete scraping session for two products.
 
-    Scrapes reviews from the specified platform, inserts them into the
-    database via bulk_insert_reviews(), and logs each scrape run.
+    Loads URLs from environment variables (multi-URL pattern), generates
+    sort variants, and scrapes all combinations.
 
     Args:
-        product_a_url: URL for product A reviews.
         product_a_id: Identifier for product A (e.g. 'product_a').
         product_a_name: Display name for product A.
-        product_b_url: URL for product B reviews.
         product_b_id: Identifier for product B (e.g. 'product_b').
         product_b_name: Display name for product B.
         platform: 'amazon' or 'flipkart'.
+        max_pages: Pages to scrape per variant URL (default 25).
 
     Returns:
         Summary dict: {"product_a": {"inserted": N, "duplicates": M},
                         "product_b": {"inserted": N, "duplicates": M}}
     """
-    scrape_fn = scrape_amazon_reviews if platform == "amazon" else scrape_flipkart_reviews
+    urls_a = load_product_urls("PRODUCT_A")
+    urls_b = load_product_urls("PRODUCT_B")
 
     summary = {}
 
@@ -495,10 +710,9 @@ def run_full_scrape(
     ) as progress:
         # --- Product A ---
         task_a = progress.add_task(f"Scraping {product_a_name}...", total=None)
-        reviews_a = scrape_fn(product_a_url, product_a_id, product_a_name, max_pages=max_pages)
-        if not reviews_a:
-            console.print(f"  [yellow]ScraperAPI failed. Trying Playwright fallback...[/]")
-            reviews_a = scrape_with_playwright_fallback(product_a_url, product_a_id, product_a_name, platform)
+        reviews_a = _scrape_single_product(
+            urls_a, product_a_id, product_a_name, platform, max_pages
+        )
         result_a = bulk_insert_reviews(reviews_a)
         total_a = get_review_count(product_a_id)
         log_scrape_run(product_a_id, result_a["inserted"], total_a, notes="full_scrape")
@@ -507,10 +721,9 @@ def run_full_scrape(
 
         # --- Product B ---
         task_b = progress.add_task(f"Scraping {product_b_name}...", total=None)
-        reviews_b = scrape_fn(product_b_url, product_b_id, product_b_name, max_pages=max_pages)
-        if not reviews_b:
-            console.print(f"  [yellow]ScraperAPI failed. Trying Playwright fallback...[/]")
-            reviews_b = scrape_with_playwright_fallback(product_b_url, product_b_id, product_b_name, platform)
+        reviews_b = _scrape_single_product(
+            urls_b, product_b_id, product_b_name, platform, max_pages
+        )
         result_b = bulk_insert_reviews(reviews_b)
         total_b = get_review_count(product_b_id)
         log_scrape_run(product_b_id, result_b["inserted"], total_b, notes="full_scrape")
@@ -525,19 +738,17 @@ def run_full_scrape(
 
 
 # ---------------------------------------------------------------------------
-# 5. Weekly Delta Scrape
+# 6. Weekly Delta Scrape
 # ---------------------------------------------------------------------------
 
 
 def run_weekly_delta_scrape(
-    product_a_url,
     product_a_id,
     product_a_name,
-    product_b_url,
     product_b_id,
     product_b_name,
     platform="amazon",
-    max_pages=10,
+    max_pages=25,
 ):
     """Run a weekly delta scrape for two products.
 
@@ -545,19 +756,19 @@ def run_weekly_delta_scrape(
     appends a summary line to logs/delta_proof.log.
 
     Args:
-        product_a_url: URL for product A reviews.
         product_a_id: Identifier for product A.
         product_a_name: Display name for product A.
-        product_b_url: URL for product B reviews.
         product_b_id: Identifier for product B.
         product_b_name: Display name for product B.
         platform: 'amazon' or 'flipkart'.
+        max_pages: Pages to scrape per variant URL (default 25).
 
     Returns:
         Summary dict: {"product_a": {"inserted": N, "duplicates": M},
                         "product_b": {"inserted": N, "duplicates": M}}
     """
-    scrape_fn = scrape_amazon_reviews if platform == "amazon" else scrape_flipkart_reviews
+    urls_a = load_product_urls("PRODUCT_A")
+    urls_b = load_product_urls("PRODUCT_B")
 
     summary = {}
 
@@ -568,7 +779,9 @@ def run_weekly_delta_scrape(
     ) as progress:
         # --- Product A ---
         task_a = progress.add_task(f"Delta scrape: {product_a_name}...", total=None)
-        reviews_a = scrape_fn(product_a_url, product_a_id, product_a_name, max_pages=max_pages)
+        reviews_a = _scrape_single_product(
+            urls_a, product_a_id, product_a_name, platform, max_pages
+        )
         result_a = bulk_insert_reviews(reviews_a)
         total_a = get_review_count(product_a_id)
         log_scrape_run(product_a_id, result_a["inserted"], total_a, notes="weekly_delta")
@@ -577,7 +790,9 @@ def run_weekly_delta_scrape(
 
         # --- Product B ---
         task_b = progress.add_task(f"Delta scrape: {product_b_name}...", total=None)
-        reviews_b = scrape_fn(product_b_url, product_b_id, product_b_name, max_pages=max_pages)
+        reviews_b = _scrape_single_product(
+            urls_b, product_b_id, product_b_name, platform, max_pages
+        )
         result_b = bulk_insert_reviews(reviews_b)
         total_b = get_review_count(product_b_id)
         log_scrape_run(product_b_id, result_b["inserted"], total_b, notes="weekly_delta")

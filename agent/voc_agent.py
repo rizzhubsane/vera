@@ -61,10 +61,8 @@ console = Console()
 
 PRODUCT_A_ID = os.getenv("PRODUCT_A_ID", "product_a")
 PRODUCT_A_NAME = os.getenv("PRODUCT_A_NAME", "Product A")
-PRODUCT_A_URL = os.getenv("PRODUCT_A_URL", "")
 PRODUCT_B_ID = os.getenv("PRODUCT_B_ID", "product_b")
 PRODUCT_B_NAME = os.getenv("PRODUCT_B_NAME", "Product B")
-PRODUCT_B_URL = os.getenv("PRODUCT_B_URL", "")
 PLATFORM = os.getenv("SCRAPE_PLATFORM", "amazon")
 
 # ---------------------------------------------------------------------------
@@ -218,11 +216,13 @@ def execute_tool(tool_name, tool_input):
     try:
         if tool_name == "scrape_reviews":
             run_type = tool_input.get("run_type", "full")
+            max_pages = tool_input.get("max_pages", 25)
             fn = run_weekly_delta_scrape if run_type == "weekly_delta" else run_full_scrape
             result = fn(
-                PRODUCT_A_URL, PRODUCT_A_ID, PRODUCT_A_NAME,
-                PRODUCT_B_URL, PRODUCT_B_ID, PRODUCT_B_NAME,
+                PRODUCT_A_ID, PRODUCT_A_NAME,
+                PRODUCT_B_ID, PRODUCT_B_NAME,
                 PLATFORM,
+                max_pages,
             )
             return json.dumps(result)
 
