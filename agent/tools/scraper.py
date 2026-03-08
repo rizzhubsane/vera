@@ -379,201 +379,315 @@ def scrape_amazon_reviews(product_url, product_id, product_name, max_pages=10):
 # ---------------------------------------------------------------------------
 
 
-def scrape_flipkart_reviews(product_url, product_id, product_name, max_pages=25):
-    """Scrape Flipkart product reviews using their internal JSON API.
-
-    All requests are routed through ScraperAPI (without rendering)
-    to avoid IP blocks. Uses ThreadPoolExecutor to concurrently
-    fetch pages across all 4 sort orders.
-
-    Args:
-        product_url: The Flipkart product URL (to extract pid).
-        product_id: Identifier like 'product_a'.
-        product_name: Human-readable product name.
-        max_pages: Maximum number of pages to scrape per sort order (default 25).
-
-    Returns:
-        A list of review dicts with standard keys.
+def scrape_flipkart_reviews(
+    product_url, product_id, product_name, max_pages=25
+):
+    """Scrape Flipkart product reviews using Playwright network interception.
+    
+    This handles the sync/async bridge to run the async scraper in a sync context.
     """
-    console.print(f"[bold cyan]Scraping Flipkart reviews for {product_name}...[/]")
+    return asyncio.run(
+        _scrape_flipkart_async(
+            product_url, product_id, product_name, max_pages
+        )
+    )
 
-    # 1. Extract pid
-    pid = parse_qs(urlparse(product_url).query).get('pid', [None])[0]
-    if not pid:
-        match = re.search(r'/p/([^?]+)', product_url)
-        if match:
-            pid = match.group(1)
 
-    if not pid:
-        console.print(f"  [red]Could not extract pid from URL: {product_url}[/]")
+async def _scrape_flipkart_async(
+    product_url, product_id, product_name, max_pages
+):
+    from playwright.async_api import async_playwright
+
+    all_reviews = []
+    seen_ids = set()
+    intercepted_responses = []
+
+    async with async_playwright() as p:
+        browser = await p.chromium.launch(
+            headless=True,
+            args=["--no-sandbox", "--disable-dev-shm-usage"]
+        )
+        context = await browser.new_context(
+            user_agent="Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
+                       "AppleWebKit/537.36 (KHTML, like Gecko) "
+                       "Chrome/122.0.0.0 Safari/537.36",
+            viewport={"width": 1280, "height": 800},
+            locale="en-IN",
+        )
+        page = await context.new_page()
+
+        # --- Network interception ---
+        async def handle_response(response):
+            url = response.url
+            if (
+                "api" in url
+                and ("review" in url.lower() or "ratings" in url.lower())
+                and response.status == 200
+            ):
+                try:
+                    content_type = response.headers.get("content-type", "")
+                    if "json" in content_type:
+                        body = await response.json()
+                        intercepted_responses.append(body)
+                        console.print(
+                            f"  [dim]Intercepted API response from: "
+                            f"{url[:80]}...[/]"
+                        )
+                except Exception:
+                    pass
+
+        page.on("response", handle_response)
+
+        # --- Load the review page ---
+        console.print(
+            f"[bold cyan]Loading Flipkart reviews for "
+            f"{product_name}...[/]"
+        )
+        await page.goto(
+            product_url,
+            wait_until="load",
+            timeout=60000,
+        )
+        await page.wait_for_timeout(5000)
+
+        # --- Paginate by clicking Next ---
+        pages_scraped = 0
+
+        while pages_scraped < max_pages:
+            # Wait for review containers
+            # Flipkart uses obfuscated classes that change. We'll use multiple fallback selectors.
+            container_selectors = ["div.col.EPCmJX", "div.ZmyHeS", "div._27M-N_"]
+            found_container = False
+            for sel in container_selectors:
+                try:
+                    await page.wait_for_selector(sel, timeout=10000)
+                    found_container = True
+                    break
+                except: continue
+            
+            if not found_container:
+                console.print(f"  [yellow]No review containers found on page {pages_scraped+1}. Stopping.[/]")
+                break
+
+            # Extract from DOM
+            review_containers = await page.query_selector_all("div.col.EPCmJX, div.ZmyHeS")
+            page_reviews = []
+            
+            for el in review_containers:
+                try:
+                    # Selectors based on current Flipkart layout
+                    rating_el = await el.query_selector("div._3LWZlK, div.X1_N6m")
+                    title_el = await el.query_selector("p._2-N8zT, p.iN7S9y")
+                    text_el = await el.query_selector("div.t-ZTKy, div.ZmyHeS div, div.row div div")
+                    date_els = await el.query_selector_all("p._2sc7ZR, p.m-88wv")
+                    
+                    rating = await rating_el.inner_text() if rating_el else ""
+                    title = await title_el.inner_text() if title_el else ""
+                    text = await text_el.inner_text() if text_el else ""
+                    
+                    # Clean the "READ MORE" text often present in Flipkart reviews
+                    text = text.replace("READ MORE", "").strip()
+                    
+                    # Date is usually the last child in the info row
+                    date_text = await date_els[-1].inner_text() if date_els else ""
+
+                    if text:
+                        # ID for dedup
+                        hash_str = f"{product_id}_{title}_{text[:100]}".encode()
+                        rev_id = hashlib.md5(hash_str).hexdigest()
+                        
+                        if rev_id not in seen_ids:
+                            seen_ids.add(rev_id)
+                            page_reviews.append({
+                                "product_id": product_id,
+                                "product_name": product_name,
+                                "review_title": title.strip()[:100],
+                                "review_text": text.strip()[:500],
+                                "rating": _extract_rating(rating) or 0.0,
+                                "review_date": _parse_flipkart_date(date_text),
+                                "source": "flipkart",
+                            })
+                except Exception as e:
+                    logger.warning("Failed to parse DOM review: %s", e)
+
+            all_reviews.extend(page_reviews)
+            console.print(
+                f"  [dim]Page {pages_scraped + 1}: "
+                f"+{len(page_reviews)} reviews "
+                f"(total: {len(all_reviews)})[/]"
+            )
+            pages_scraped += 1
+
+            if pages_scraped >= max_pages:
+                break
+
+            # Find and click the Next button
+            next_clicked = False
+            next_selectors = [
+                 "nav a:has-text('Next')",
+                 "a[href*='page=']:has-text('Next')",
+                 "//span[text()='Next']/parent::a",
+                 "a._1LKTO3:last-child"
+            ]
+            for selector in next_selectors:
+                try:
+                    if selector.startswith("//"):
+                        btn = await page.wait_for_selector(selector, timeout=5000)
+                    else:
+                        btn = await page.query_selector(selector)
+                    
+                    if btn:
+                        # Scroll into view to ensure clickability
+                        await btn.scroll_into_view_if_needed()
+                        await btn.click()
+                        await page.wait_for_timeout(3000)
+                        await page.wait_for_load_state("load")
+                        next_clicked = True
+                        break
+                except Exception:
+                    continue
+
+            if not next_clicked:
+                console.print(
+                    f"  [yellow]No Next button found. "
+                    f"Stopping at page {pages_scraped}.[/]"
+                )
+                break
+
+        await browser.close()
+
+    console.print(
+        f"[green]Scraped {len(all_reviews)} Flipkart reviews "
+        f"for {product_name}.[/]"
+    )
+    return all_reviews
+
+
+def _parse_intercepted_flipkart_responses(
+    responses: list,
+    seen_ids: set,
+    product_id: str,
+    product_name: str,
+) -> list[dict]:
+    """Parse intercepted JSON responses and extract review dicts."""
+    new_reviews = []
+
+    def find_reviews(obj):
+        """Recursively find review objects in nested JSON."""
+        if isinstance(obj, dict):
+            if ("rating" in obj or "value" in obj) and (
+                "text" in obj or "review" in obj or "reviewText" in obj
+            ):
+                return [obj]
+            if "reviewId" in obj or "review_id" in obj:
+                return [obj]
+            for key in ("data", "RESPONSE", "reviews", "reviewData",
+                        "reviewDetails", "paginatedData"):
+                if key in obj:
+                    result = find_reviews(obj[key])
+                    if result:
+                        return result
+            for v in obj.values():
+                if isinstance(v, (dict, list)):
+                    result = find_reviews(v)
+                    if result:
+                        return result
+        elif isinstance(obj, list):
+            found = []
+            for item in obj:
+                if isinstance(item, dict):
+                    if ("rating" in item or "value" in item) and (
+                        "text" in item
+                        or "review" in item
+                        or "reviewText" in item
+                        or "reviewId" in item
+                    ):
+                        found.append(item)
+                    else:
+                        found.extend(find_reviews(item))
+            return found
         return []
 
-    # 4. Shared state for concurrency
-    seen_ids = set()
-    all_reviews = []
-    SORT_ORDERS = ["MOST_HELPFUL", "RECENT", "POSITIVE_FIRST", "NEGATIVE_FIRST"]
-
-    def fetch_sort_order(sort_order):
-        local_reviews = []
-        consecutive_high_dup_pages = 0
-        
-        for page in range(1, max_pages + 1):
+    for resp in responses:
+        reviews_list = find_reviews(resp)
+        for review in reviews_list:
             try:
-                # Built exactly matching the DevTools network tab
-                api_target = f"https://www.flipkart.com/api/3/page/dynamic/product-reviews?pid={pid}&sortOrder={sort_order}&page={page}&count=10"
-                proxy_url = _scraperapi_json_url(api_target)
+                rating = (
+                    review.get("rating")
+                    or review.get("value")
+                    or review.get("starRating")
+                )
+                if isinstance(rating, dict):
+                    rating = rating.get("value") or rating.get("rating")
 
-                console.print(f"  [dim]Page {page}/{max_pages} sort={sort_order}...[/]")
-                
-                # Fetch JSON without custom headers; let ScraperAPI handle it
-                response = requests.get(proxy_url, timeout=60)
-                response.raise_for_status()
-                data = response.json()
+                title = (
+                    review.get("title")
+                    or review.get("summary")
+                    or review.get("reviewTitle", "")
+                )
+                if isinstance(title, dict):
+                    title = title.get("text", "")
 
-                # Find reviews array deep in FlipKart's JSON structure
-                reviews_list = []
-                try:
-                    # Recursive search function to find lists of review objects
-                    def find_reviews(obj):
-                        if isinstance(obj, dict):
-                            if "author" in obj and "rating" in obj and ("text" in obj or "reviewer" in obj):
-                                return [obj]
-                            # Or look for 'reviewId'
-                            if "reviewId" in obj:
-                                return [obj]
-                            # Standard places
-                            if "data" in obj:
-                                res = find_reviews(obj["data"])
-                                if res: return res
-                            if "RESPONSE" in obj:
-                                res = find_reviews(obj["RESPONSE"])
-                                if res: return res
-                            # Search all values
-                            for k, v in obj.items():
-                                if k == "reviews" and isinstance(v, list):
-                                    return v
-                                if isinstance(v, (dict, list)):
-                                    res = find_reviews(v)
-                                    if res: return res
-                        elif isinstance(obj, list):
-                            found = []
-                            for item in obj:
-                                if isinstance(item, dict):
-                                    # If it looks like a review, grab it
-                                    if "author" in item and "rating" in item:
-                                        found.append(item)
-                                    elif "reviewId" in item:
-                                        found.append(item)
-                                    else:
-                                        res = find_reviews(item)
-                                        if res: found.extend(res)
-                            if found: return found
-                        return []
-                    
-                    reviews_list = find_reviews(data)
-                except Exception as e:
-                    logger.debug(f"JSON extraction error: {e}")
+                text = (
+                    review.get("text")
+                    or review.get("review")
+                    or review.get("reviewText")
+                    or review.get("description", "")
+                )
+                if isinstance(text, dict):
+                    text = text.get("text", "")
 
-                if not reviews_list:
-                    console.print(f"  [dim]No more JSON reviews on page {page} for {sort_order}[/]")
-                    break
+                rev_id = (
+                    review.get("id")
+                    or review.get("reviewId")
+                    or review.get("review_id")
+                )
+                if not rev_id:
+                    hash_str = f"{product_id}_{title}_{text}".encode()
+                    rev_id = hashlib.md5(hash_str).hexdigest()
 
-                page_new_reviews = []
-                for review in reviews_list:
-                    # 5. Extract fields safely
-                    rating = review.get("rating") or review.get("value")
-                    if isinstance(rating, dict): rating = rating.get("value", rating)
-                    
-                    title = review.get("title") or review.get("summary")
-                    if isinstance(title, dict): title = title.get("text", title)
-                        
-                    text = review.get("text") or review.get("review") or review.get("reviewText")
-                    reviewer = review.get("author") or review.get("reviewerName")
-                    
-                    try:
-                        parsed_rating = float(rating) if rating is not None else 0.0
-                    except:
-                        parsed_rating = _extract_rating(str(rating)) or 0.0
+                if rev_id in seen_ids:
+                    continue
 
-                    # ID generation/extraction
-                    rev_id = review.get("id") or review.get("reviewId")
-                    if not rev_id:
-                        hash_str = f"{pid}_{title}_{text}".encode('utf-8')
-                        rev_id = hashlib.md5(hash_str).hexdigest()
-
-                    # Deduplication using global seen_ids
-                    if rev_id in seen_ids:
-                        continue
-
-                    # Date processing
-                    raw_date = review.get("created") or review.get("reviewAge", "")
-                    if str(raw_date).isdigit() and len(str(raw_date)) > 8:
-                        dt = datetime.fromtimestamp(int(str(raw_date)[:10]))
-                        parsed_date = dt.strftime("%Y-%m-%d")
-                    elif "ago" in str(raw_date).lower():
-                        parsed_date = _parse_flipkart_date(str(raw_date))
-                    elif re.match(r'\d{4}-\d{2}-\d{2}', str(raw_date)):
-                        parsed_date = str(raw_date)[:10]
-                    else:
-                        parsed_date = _parse_flipkart_date(str(raw_date))
-
-                    title_str = str(title).strip() if title else ""
-                    text_str = str(text).strip() if text else ""
-
-                    if text_str and parsed_rating:
-                        seen_ids.add(rev_id)
-                        page_new_reviews.append({
-                            "product_id": product_id,
-                            "product_name": product_name,
-                            "review_title": title_str[:100],
-                            "review_text": text_str[:500],
-                            "rating": parsed_rating,
-                            "review_date": parsed_date,
-                            "source": "flipkart",
-                        })
-
-                # Check for high duplication rate
-                dups = len(reviews_list) - len(page_new_reviews)
-                console.print(f"  [dim]Retrieved {len(reviews_list)} | {dups} duplicates[/]")
-                
-                dup_ratio = dups / max(len(reviews_list), 1)
-                if dup_ratio > 0.70:
-                    consecutive_high_dup_pages += 1
-                    if consecutive_high_dup_pages >= 3:
-                        console.print(f"  [yellow]Duplication too high for {sort_order}, stopping.[/]")
-                        break
+                raw_date = (
+                    review.get("created")
+                    or review.get("reviewAge")
+                    or review.get("date", "")
+                )
+                if str(raw_date).isdigit() and len(str(raw_date)) > 8:
+                    dt = datetime.fromtimestamp(int(str(raw_date)[:10]))
+                    parsed_date = dt.strftime("%Y-%m-%d")
+                elif "ago" in str(raw_date).lower():
+                    parsed_date = _parse_flipkart_date(str(raw_date))
+                elif re.match(r"\d{4}-\d{2}-\d{2}", str(raw_date)):
+                    parsed_date = str(raw_date)[:10]
                 else:
-                    consecutive_high_dup_pages = 0
+                    parsed_date = _parse_flipkart_date(str(raw_date))
 
-                local_reviews.extend(page_new_reviews)
+                try:
+                    parsed_rating = float(rating) if rating else 0.0
+                except Exception:
+                    parsed_rating = _extract_rating(str(rating)) or 0.0
 
-                # Politeness
-                time.sleep(random.uniform(1.5, 3.0))
+                title_str = str(title).strip()[:100] if title else ""
+                text_str = str(text).strip()[:500] if text else ""
 
+                if text_str and parsed_rating:
+                    seen_ids.add(rev_id)
+                    new_reviews.append({
+                        "product_id": product_id,
+                        "product_name": product_name,
+                        "review_title": title_str,
+                        "review_text": text_str,
+                        "rating": parsed_rating,
+                        "review_date": parsed_date,
+                        "source": "flipkart",
+                    })
             except Exception as e:
-                logger.error("Failed to scrape Flipkart API page %d (sort=%s): %s", page, sort_order, e)
-                console.print(f"  [red]Error on page {page} ({sort_order}): {e}[/]")
-                break
-                
-        return local_reviews
+                logger.warning("Failed to parse intercepted review: %s", e)
+                continue
 
-    # Execute all sort orders concurrently
-    with ThreadPoolExecutor(max_workers=5) as executor:
-        futures = {executor.submit(fetch_sort_order, sort): sort for sort in SORT_ORDERS}
-        for future in as_completed(futures):
-            try:
-                res = future.result()
-                all_reviews.extend(res)
-            except Exception as e:
-                console.print(f"  [red]Thread error: {e}[/]")
-
-    # 7. Fallback behavior
-    if not all_reviews:
-        console.print("[yellow]API returned 0 reviews. Trying Playwright fallback...[/]")
-        all_reviews = scrape_with_playwright_fallback(product_url, product_id, product_name, platform="flipkart")
-
-    console.print(f"[green]Scraped {len(all_reviews)} Flipkart reviews for {product_name}.[/]")
-    return all_reviews
+    return new_reviews
 
 
 # ---------------------------------------------------------------------------
@@ -723,10 +837,15 @@ def _scrape_single_product(
         return []
 
     # Generate sort-variant URLs and deduplicate
-    final_urls = _generate_sort_variant_urls(urls)
-
-    # Part E — log the plan
-    _print_scrape_plan(product_name, urls, final_urls, max_pages)
+    if platform == "flipkart":
+        final_urls = urls  # no variant expansion needed
+        console.print(
+            f"\n[bold cyan]Scraping {product_name} via "
+            f"Playwright network interception[/]"
+        )
+    else:
+        final_urls = _generate_sort_variant_urls(urls)
+        _print_scrape_plan(product_name, urls, final_urls, max_pages)
 
     scrape_fn = scrape_amazon_reviews if platform == "amazon" else scrape_flipkart_reviews
     all_reviews = []
@@ -752,7 +871,7 @@ def _scrape_single_product(
             time.sleep(random.uniform(1, 2))
 
     # Playwright fallback if we got nothing at all
-    if not all_reviews and urls:
+    if not all_reviews and urls and platform == "amazon":
         console.print(f"[yellow]All ScraperAPI attempts failed for {product_name}. "
                        f"Trying Playwright fallback on first URL...[/]")
         all_reviews = scrape_with_playwright_fallback(

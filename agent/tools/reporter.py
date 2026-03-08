@@ -122,90 +122,131 @@ def notify_slack_dm(report_content: str, report_type: str) -> dict:
 
 def generate_global_action_report(product_a_id, product_b_id):
     """Generate a comprehensive action-item report for all teams using Groq."""
-    insights_a = get_theme_insights(product_a_id)
-    insights_b = get_theme_insights(product_b_id)
-    insights_all = get_theme_insights()
+    # Fetch data for Product A and B
+    reviews_a = get_reviews(product_id=product_a_id, limit=500)
+    reviews_b = get_reviews(product_id=product_b_id, limit=500)
+    all_reviews = reviews_a + reviews_b
     
-    # Fetch full reviews for deep analysis
-    all_reviews = get_reviews(limit=1000)
+    total_count = len(all_reviews)
+    count_a = len(reviews_a)
+    count_b = len(reviews_b)
     
+    # Sentiment data
+    sentiment_data = json.dumps(get_sentiment_breakdown(), indent=2)
+    
+    # Theme data with avg rating
+    theme_freq = get_theme_frequency()
+    theme_stats = {}
+    for theme in VALID_THEMES:
+        theme_reviews = [r for r in all_reviews if r.get("themes") and theme in r["themes"]]
+        if theme_reviews:
+            avg_rating = sum(r["rating"] for r in theme_reviews) / len(theme_reviews)
+            theme_stats[theme] = {
+                "count": len(theme_reviews),
+                "avg_rating": round(avg_rating, 2)
+            }
+    theme_data = json.dumps(theme_stats, indent=2)
+    
+    # Most recent 50 reviews for sampling
+    sorted_reviews = sorted(all_reviews, key=lambda x: x.get("review_date") or "", reverse=True)
+    sample_raw = sorted_reviews[:50]
+    sample_reviews = json.dumps([
+        {
+            "product_id": r["product_id"],
+            "review_text": r["review_text"],
+            "rating": r["rating"],
+            "themes": r["themes"].split(",") if isinstance(r["themes"], str) else r["themes"],
+            "sentiment": r["sentiment"],
+            "review_date": r["review_date"]
+        } for r in sample_raw
+    ], indent=2)
+
     timestamp = datetime.now(timezone.utc).strftime("%Y-%m-%d_%H%M%S")
     
-    # Collect raw data as JSON to inject into prompt
-    db_data = json.dumps({
-        "all_product_insights": insights_all,
-        "product_a_insights": insights_a,
-        "product_b_insights": insights_b,
-        "raw_reviews": [
-            {
-                "review_text": r["review_text"],
-                "rating": r["rating"],
-                "theme": r["themes"],
-                "sentiment": r["sentiment"],
-                "review_date": r["review_date"]
-            } for r in all_reviews
-        ]
-    }, indent=2)
+    system_prompt = """
+You are Vera, an elite Voice of Customer analyst. You have 
+been given structured review data from a SQLite database. 
+Your job is to generate a comprehensive action item report 
+segmented by department.
 
-    prompt = f"""
-You are Vera, a Senior Consumer Insights Analyst. 
-Write a deeply reasoned, evidence-backed Global Action Report based ONLY on the following JSON SQLite database export.
-"You must cite the exact number of reviews behind every claim. Never make a claim that cannot be traced to a specific count in the data provided. If you don't have enough data, say so."
+STRICT RULES:
+1. Every single claim must cite exact numbers: 
+   "X of Y reviews mention..." or "Z% of negative reviews..."
+2. Include 2-3 verbatim review quotes per theme as evidence. 
+   Keep quotes under 20 words.
+3. Never write vague recommendations like "improve X". 
+   Every action item must follow this format:
+   ACTION: [Specific thing to do]
+   BECAUSE: [Exact data that justifies it]
+   METRIC: [How to measure success]
+4. If data is insufficient to make a claim, say exactly 
+   what data is missing.
+5. Compare products directly wherever the data supports it.
+"""
 
-The report must include these markdown sections and follow this EXACT structure:
+    user_prompt = f"""
+Generate a full action item report from this review data.
 
-# VOC Global Action Report
+TOTAL REVIEWS: {total_count}
+PRODUCT A ({product_a_id}): {count_a} reviews
+PRODUCT B ({product_b_id}): {count_b} reviews
 
-## Executive Summary
-(Brief overview of the competitive landscape and top priorities)
+SENTIMENT BREAKDOWN:
+{sentiment_data}
 
-## 🔧 PRODUCT TEAM ACTIONS
-For each theme with significant negative mentions:
-- Theme name + exact count + % of total reviews + avg rating when mentioned
-- 2-3 direct review quotes as evidence (verbatim, under 20 words each)
-- Root cause hypothesis based on the pattern of complaints
-- Specific, testable action item (not "improve X" but "investigate Y because Z% of 1-star reviews mention it alongside W")
+THEME FREQUENCY (with avg rating per theme):
+{theme_data}
 
-## 📣 MARKETING TEAM ACTIONS
+SAMPLE REVIEWS (most recent 50, full text):
+{sample_reviews}
+
+Structure your report EXACTLY as follows:
+
+## 📦 PRODUCT TEAM
+For each theme with >10% negative mentions:
+- Theme name | Negative count | % of total | Avg rating
+- 2 supporting verbatim quotes
+- Root cause hypothesis
+- Specific action item (ACTION / BECAUSE / METRIC format)
+
+## 📣 MARKETING TEAM  
 - Top 3 themes customers spontaneously praise (use as proof points)
-- Exact language customers use when praising (for copy/messaging)
-- Competitor comparisons mentioned in reviews (if any)
-- Segments who love the product (verified buyers, specific use cases)
+- Exact language customers use when praising (for ad copy)
+- Which product has stronger word-of-mouth signals and why
+- 3 specific messaging recommendations with data backing
 
-## 🎧 SUPPORT TEAM ACTIONS
-- Top recurring issues that need troubleshooting guides, with frequency
-- Exact error descriptions customers report verbatim
-- Reviews that suggest unmet expectations (expectation vs reality gaps)
+## 🛠️ SUPPORT TEAM
+- Top 5 recurring issues with exact frequency counts
+- Verbatim error descriptions customers report
+- Expectation vs reality gaps identified from reviews
+- Recommended troubleshooting guide topics ranked by urgency
 
-Here is the database export:
-{db_data}
+## 📊 COMPETITIVE SUMMARY
+- Where Product A beats Product B (with counts)
+- Where Product B beats Product A (with counts)  
+- Overall sentiment score comparison
 """
 
     client = Groq()
     response = client.chat.completions.create(
         model="llama-3.3-70b-versatile",
-        messages=[{"role": "user", "content": prompt}],
+        messages=[
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": user_prompt}
+        ],
         temperature=0.2,
         max_tokens=4000
     )
     
     report_content = response.choices[0].message.content
-    
     report = f"{report_content}\n\n---\n*Report generated on {timestamp}*\n*Full report saved to reports/global_action_report.md*"
 
-    # Save to file (PRD explicitly requires this exact filename for the final run)
     filepath = os.path.join(REPORTS_DIR, "global_action_report.md")
     with open(filepath, "w") as f:
         f.write(report)
 
     # Trigger Slack DM notification
-    slack_res = notify_slack_dm(report_content, "global")
-    if slack_res["status"] == "ok":
-        logger.info("Slack DM sent successfully")
-    elif slack_res["status"] == "skipped":
-        logger.info("Slack DM skipped — SLACK_BOT_TOKEN or SLACK_USER_ID not configured")
-    else:
-        logger.warning(f"Slack DM failed: {slack_res['error']}")
+    notify_slack_dm(report_content, "global")
 
     return report
 
@@ -214,103 +255,119 @@ def generate_weekly_delta_report(product_a_id, product_b_id, since_date=None):
     """Generate a delta report for reviews added since a given date using Groq."""
     if not since_date:
         from datetime import timedelta
-        since_date = (datetime.now(timezone.utc) - timedelta(days=7)).isoformat()
-        last_week_start = (datetime.now(timezone.utc) - timedelta(days=14)).isoformat()
+        since_date = (datetime.now(timezone.utc) - timedelta(days=7)).strftime("%Y-%m-%d")
+        last_week_start = (datetime.now(timezone.utc) - timedelta(days=14)).strftime("%Y-%m-%d")
     else:
         # If since_date provided, assume last week is the 7 days prior to that
-        start_dt = datetime.fromisoformat(since_date.replace("Z", "+00:00"))
+        start_dt = datetime.strptime(since_date[:10], "%Y-%m-%d")
         from datetime import timedelta
-        last_week_start = (start_dt - timedelta(days=7)).isoformat()
+        last_week_start = (start_dt - timedelta(days=7)).strftime("%Y-%m-%d")
 
     new_reviews = get_reviews_since(since_date)
     last_week_reviews = get_reviews_since(last_week_start, end_date=since_date)
 
-    # Simplified theme frequency for comparison
-    def get_freq(reviews):
-        freq = {}
+    def get_theme_breakdown(reviews):
+        breakdown = {}
         for r in reviews:
-            t = r.get("theme") or "Other"
-            freq[t] = freq.get(t, 0) + 1
-        return freq
+            themes = r.get("themes")
+            if not themes: continue
+            theme_list = themes.split(",") if isinstance(themes, str) else themes
+            for t in theme_list:
+                t = t.strip()
+                breakdown[t] = breakdown.get(t, 0) + 1
+        return breakdown
 
-    this_week_freq = get_freq(new_reviews)
-    last_week_freq = get_freq(last_week_reviews)
+    this_week_theme_breakdown = json.dumps(get_theme_breakdown(new_reviews), indent=2)
+    last_week_theme_breakdown = json.dumps(get_theme_breakdown(last_week_reviews), indent=2)
+    
+    new_reviews_sample = json.dumps([
+        {
+            "product_id": r["product_id"],
+            "review_text": r["review_text"],
+            "rating": r["rating"],
+            "themes": r["themes"].split(",") if isinstance(r["themes"], str) else r["themes"],
+            "sentiment": r["sentiment"],
+            "review_date": r["review_date"]
+        } for r in new_reviews[:50]
+    ], indent=2)
 
     timestamp = datetime.now(timezone.utc).strftime("%Y-%m-%d_%H%M%S")
     
-    # Collect raw data as JSON to inject into prompt
-    db_data = json.dumps({
-        "this_week_counts": this_week_freq,
-        "last_week_counts": last_week_freq,
-        "new_reviews_detail": [
-            {
-                "review_text": r["review_text"],
-                "rating": r["rating"],
-                "theme": r["themes"],
-                "sentiment": r["sentiment"],
-                "review_date": r["review_date"]
-            } for r in new_reviews
-        ],
-        "total_new_reviews": len(new_reviews)
-    }, indent=2)
+    system_prompt = """
+You are Vera, an elite Voice of Customer analyst. You have 
+been given structured review data from a SQLite database. 
+Your job is to generate a comprehensive action item report 
+segmented by department.
 
-    prompt = f"""
-You are Vera, a Senior Consumer Insights Analyst. 
-Write a Weekly Delta Report based ONLY on the following JSON SQLite database export of NEW reviews since {since_date}.
-"You must cite the exact number of reviews behind every claim. Never make a claim that cannot be traced to a specific count in the data provided. If you don't have enough data, say so."
+STRICT RULES:
+1. Every single claim must cite exact numbers: 
+   "X of Y reviews mention..." or "Z% of negative reviews..."
+2. Include 2-3 verbatim review quotes per theme as evidence. 
+   Keep quotes under 20 words.
+3. Never write vague recommendations like "improve X". 
+   Every action item must follow this format:
+   ACTION: [Specific thing to do]
+   BECAUSE: [Exact data that justifies it]
+   METRIC: [How to measure success]
+4. If data is insufficient to make a claim, say exactly 
+   what data is missing.
+5. Compare products directly wherever the data supports it.
+"""
 
-The report must include these markdown sections:
+    user_prompt = f"""
+Generate a weekly delta report comparing this week vs last week.
 
-# VOC Weekly Delta Report
+THIS WEEK ({since_date} to today):
+New reviews: {len(new_reviews)}
+{this_week_theme_breakdown}
 
-## Emerging Themes (New This Week)
-Compare this week's theme counts to last week's theme counts.
-1. List all themes.
-2. Flag any theme with >15% change in frequency (up or down) as a SPIKE.
-3. For each spike, pull 2 supporting review quotes from THIS week.
-4. Assign an urgency level: 
-   - CRITICAL (>30% spike)
-   - WATCH (15-30%)
-   - STABLE (<15% change)
+LAST WEEK (baseline):
+{last_week_theme_breakdown}
 
-## 🔧 PRODUCT TEAM ACTIONS
-(Same detailed requirements as Global report but focused on this week's trends)
+SAMPLE OF NEW REVIEWS THIS WEEK (full text):
+{new_reviews_sample}
 
-## 📣 MARKETING TEAM ACTIONS
-(Same detailed requirements as Global report but focused on this week's trends)
+Structure your report EXACTLY as follows:
 
-## 🎧 SUPPORT TEAM ACTIONS
-(Same detailed requirements as Global report but focused on this week's trends)
+## 🚨 SPIKES & ALERTS
+For each theme with >15% change week-over-week:
+- Theme | This week count | Last week count | % change
+- Direction: ▲ UP or ▼ DOWN
+- Urgency: CRITICAL (>30% change) | WATCH (15-30%) | STABLE
+- 2 supporting quotes from this week's reviews
+- Recommended immediate action
 
-Here is the database export of new reviews:
-{db_data}
+## 📈 POSITIVE TRENDS
+Themes gaining positive momentum this week
+
+## 📉 NEGATIVE TRENDS  
+Themes with worsening sentiment this week
+
+## 💡 WEEKLY RECOMMENDATION
+One highest-priority action item for the team this week,
+with full data justification.
 """
 
     client = Groq()
     response = client.chat.completions.create(
         model="llama-3.3-70b-versatile",
-        messages=[{"role": "user", "content": prompt}],
+        messages=[
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": user_prompt}
+        ],
         temperature=0.2,
         max_tokens=4000
     )
     
     report_content = response.choices[0].message.content
-    
     report = f"{report_content}\n\n---\n*Report generated on {timestamp}*\n*Full report saved to reports/weekly_delta_report.md*"
 
-    filename = "weekly_delta_report.md"
-    filepath = os.path.join(REPORTS_DIR, filename)
+    filepath = os.path.join(REPORTS_DIR, "weekly_delta_report.md")
     with open(filepath, "w") as f:
         f.write(report)
 
     # Trigger Slack DM notification
-    slack_res = notify_slack_dm(report_content, "weekly_delta")
-    if slack_res["status"] == "ok":
-        logger.info("Slack DM sent successfully")
-    elif slack_res["status"] == "skipped":
-        logger.info("Slack DM skipped — SLACK_BOT_TOKEN or SLACK_USER_ID not configured")
-    else:
-        logger.warning(f"Slack DM failed: {slack_res['error']}")
+    notify_slack_dm(report_content, "weekly_delta")
 
     return report
 
