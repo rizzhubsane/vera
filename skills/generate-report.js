@@ -1,4 +1,4 @@
-const PROJECT_PATH = "/Users/rishabhsain/Desktop/voc";
+const PROJECT_PATH = process.env.PROJECT_PATH || require('path').resolve(__dirname, '..');
 
 module.exports = {
     name: "generate-report",

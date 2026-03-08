@@ -30,6 +30,7 @@ from rich.panel import Panel
 from rich.prompt import Prompt
 
 from agent.tools.database import (
+    initialize_database,
     get_review_count,
     get_reviews,
     get_last_scrape_date,
@@ -479,6 +480,7 @@ def start_interactive_chat():
 # ---------------------------------------------------------------------------
 
 if __name__ == "__main__":
+    initialize_database()  # Ensure tables exist before any DB read
     if len(sys.argv) > 1:
         cmd = sys.argv[1]
         if cmd == "chat":

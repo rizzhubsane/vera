@@ -1,4 +1,4 @@
-const PROJECT_PATH = "/Users/rishabhsain/Desktop/voc";
+const PROJECT_PATH = process.env.PROJECT_PATH || require('path').resolve(__dirname, '..');
 
 module.exports = {
   name: "scrape-reviews",
@@ -25,9 +25,12 @@ load_dotenv()
 from agent.tools.scraper import run_full_scrape, run_weekly_delta_scrape
 fn = run_weekly_delta_scrape if '${run_type}' == 'weekly_delta' else run_full_scrape
 result = fn(
-    os.getenv('PRODUCT_A_URL'), os.getenv('PRODUCT_A_ID', 'product_a'), os.getenv('PRODUCT_A_NAME', 'Master Buds 1'),
-    os.getenv('PRODUCT_B_URL'), os.getenv('PRODUCT_B_ID', 'product_b'), os.getenv('PRODUCT_B_NAME', 'Master Buds Max'),
-    os.getenv('SCRAPE_PLATFORM', 'flipkart'), int(${max_pages})
+    os.getenv('PRODUCT_A_ID', 'product_a'),
+    os.getenv('PRODUCT_A_NAME', 'Master Buds 1'),
+    os.getenv('PRODUCT_B_ID', 'product_b'),
+    os.getenv('PRODUCT_B_NAME', 'Master Buds Max'),
+    os.getenv('SCRAPE_PLATFORM', 'flipkart'),
+    int(${max_pages})
 )
 print(json.dumps(result))
 "`);

@@ -233,20 +233,23 @@ def get_unprocessed_reviews(limit=100):
         return [dict(row) for row in cursor.fetchall()]
 
 
-def get_reviews_since(date_str, product_id=None):
-    """Return all reviews scraped after a given date.
+def get_reviews_date_range(start_date, end_date=None, product_id=None):
+    """Return all reviews scraped within a given date range.
 
     Args:
-        date_str: An ISO-format date/datetime string. Reviews with
-                  scraped_at greater than this value are returned.
+        start_date: ISO-format date/datetime string for start (exclusive).
+        end_date: ISO-format date/datetime string for end (inclusive).
         product_id: If provided, filter to this product only.
 
     Returns:
         A list of dicts, each representing a review row.
     """
     query = "SELECT * FROM reviews WHERE scraped_at > ?"
-    params = [date_str]
+    params = [start_date]
 
+    if end_date:
+        query += " AND scraped_at <= ?"
+        params.append(end_date)
     if product_id:
         query += " AND product_id = ?"
         params.append(product_id)
@@ -256,6 +259,14 @@ def get_reviews_since(date_str, product_id=None):
         cursor = conn.cursor()
         cursor.execute(query, params)
         return [dict(row) for row in cursor.fetchall()]
+
+
+def get_reviews_since(date_str, product_id=None, end_date=None):
+    """Return all reviews scraped after a given date.
+
+    Backward compatibility wrapper for get_reviews_date_range.
+    """
+    return get_reviews_date_range(date_str, end_date=end_date, product_id=product_id)
 
 
 def log_scrape_run(product_id, new_count, total_count, notes=""):

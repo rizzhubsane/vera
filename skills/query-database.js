@@ -1,25 +1,18 @@
-const PROJECT_PATH = "/Users/rishabhsain/Desktop/voc";
+const PROJECT_PATH = process.env.PROJECT_PATH || require('path').resolve(__dirname, '..');
 
 module.exports = {
     name: "query-database",
-    description: "Query the SQLite reviews database with flexible filters. Always call this before answering questions about reviews to ensure grounded, data-backed responses.",
+    description: "Submit a natural language question to the SQLite reviews database. Vera will search the data, analyze matching reviews, and provide a grounded, evidence-backed answer.",
     parameters: {
-        product_id: { type: "string", description: "product_a or product_b (omit for both)" },
-        sentiment: { type: "string", enum: ["Positive", "Negative", "Neutral"], description: "Filter by sentiment" },
-        theme: { type: "string", description: "Filter by theme e.g. 'ANC', 'Battery Life', 'Comfort & Fit'" },
-        keyword: { type: "string", description: "Keyword to search in review text" },
-        limit: { type: "number", description: "Max results to return", default: 20 }
+        question: { type: "string", description: "The natural language question to ask Vera (e.g., 'What are the main complaints about battery life for Master Buds 1?')" }
     },
-    async run({ product_id, sentiment, theme, keyword, limit = 20 }, { bash }) {
-        const args = JSON.stringify({ product_id, sentiment, theme, keyword, limit });
+    async run({ question }, { bash }) {
         const result = await bash(`cd ${PROJECT_PATH} && python -c "
 import sys, json
 sys.path.insert(0, '${PROJECT_PATH}')
-from agent.tools.database import get_reviews
-args = json.loads('''${args}''')
-filters = {k: v for k, v in args.items() if v is not None}
-reviews = get_reviews(**filters)
-print(json.dumps(reviews, indent=2))
+from agent.tools.query_engine import query_reviews
+result = query_reviews('''${question}''')
+print(result)
 "`);
         return result.stdout || result.stderr;
     }

@@ -21,6 +21,9 @@ import asyncio
 import logging
 from datetime import datetime, timezone
 from urllib.parse import quote_plus, urlparse, parse_qs, urlencode, urlunparse
+import json
+import hashlib
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
 import requests
 from bs4 import BeautifulSoup
@@ -190,13 +193,25 @@ def _print_scrape_plan(
 
 
 def _scraperapi_url(target_url: str) -> str:
-    """Build a ScraperAPI proxy URL for the given target URL."""
+    """Build a ScraperAPI proxy URL for the given HTML target URL."""
     return (
         f"http://api.scraperapi.com"
         f"?api_key={SCRAPER_API_KEY}"
         f"&url={quote_plus(target_url)}"
         f"&render=true"
     )
+
+def _scraperapi_json_url(target_url: str) -> str:
+    """Build a ScraperAPI proxy URL for the given JSON API target URL.
+    Overrides render=false because JS execution is not needed for JSON data.
+    """
+    return (
+        f"http://api.scraperapi.com"
+        f"?api_key={SCRAPER_API_KEY}"
+        f"&url={quote_plus(target_url)}"
+        f"&render=false"
+    )
+
 
 
 def _parse_amazon_date(date_text: str) -> str:
@@ -364,115 +379,198 @@ def scrape_amazon_reviews(product_url, product_id, product_name, max_pages=10):
 # ---------------------------------------------------------------------------
 
 
-def scrape_flipkart_reviews(product_url, product_id, product_name, max_pages=10):
-    """Scrape Flipkart product reviews via ScraperAPI + BeautifulSoup.
+def scrape_flipkart_reviews(product_url, product_id, product_name, max_pages=25):
+    """Scrape Flipkart product reviews using their internal JSON API.
 
-    Uses multiple fallback CSS selectors since Flipkart frequently
-    changes its class names.
+    All requests are routed through ScraperAPI (without rendering)
+    to avoid IP blocks. Uses ThreadPoolExecutor to concurrently
+    fetch pages across all 4 sort orders.
 
     Args:
-        product_url: The Flipkart product reviews URL.
+        product_url: The Flipkart product URL (to extract pid).
         product_id: Identifier like 'product_a'.
         product_name: Human-readable product name.
-        max_pages: Maximum number of pages to scrape (default 10).
+        max_pages: Maximum number of pages to scrape per sort order (default 25).
 
     Returns:
-        A list of review dicts with keys: product_id, product_name,
-        review_title, review_text, rating, review_date, source.
+        A list of review dicts with standard keys.
     """
-    all_reviews = []
-
     console.print(f"[bold cyan]Scraping Flipkart reviews for {product_name}...[/]")
 
-    for page in range(1, max_pages + 1):
-        try:
-            page_url = f"{product_url}&page={page}"
-            api_url = _scraperapi_url(page_url)
+    # 1. Extract pid
+    pid = parse_qs(urlparse(product_url).query).get('pid', [None])[0]
+    if not pid:
+        match = re.search(r'/p/([^?]+)', product_url)
+        if match:
+            pid = match.group(1)
 
-            console.print(f"  [dim]Page {page}/{max_pages}...[/]")
-            html = _fetch_page(api_url)
-            soup = BeautifulSoup(html, "html.parser")
+    if not pid:
+        console.print(f"  [red]Could not extract pid from URL: {product_url}[/]")
+        return []
 
-            # Flipkart's new React Native web DOM uses heavily obfuscated classes like css-175oi2r
-            # Ratings can be "5" or "5.0"
-            rating_els = soup.find_all("div", string=re.compile(r"^[1-5](\.0)?$"))
-            
-            if not rating_els:
-                console.print(f"  [yellow]No reviews found on page {page}. Stopping.[/]")
-                break
+    # 4. Shared state for concurrency
+    seen_ids = set()
+    all_reviews = []
+    SORT_ORDERS = ["MOST_HELPFUL", "RECENT", "POSITIVE_FIRST", "NEGATIVE_FIRST"]
 
-            processed_containers = set()
+    def fetch_sort_order(sort_order):
+        local_reviews = []
+        consecutive_high_dup_pages = 0
+        
+        for page in range(1, max_pages + 1):
+            try:
+                # Built exactly matching the DevTools network tab
+                api_target = f"https://www.flipkart.com/api/3/page/dynamic/product-reviews?pid={pid}&sortOrder={sort_order}&page={page}&count=10"
+                proxy_url = _scraperapi_json_url(api_target)
 
-            for rating_el in rating_els:
+                console.print(f"  [dim]Page {page}/{max_pages} sort={sort_order}...[/]")
+                
+                # Fetch JSON without custom headers; let ScraperAPI handle it
+                response = requests.get(proxy_url, timeout=60)
+                response.raise_for_status()
+                data = response.json()
+
+                # Find reviews array deep in FlipKart's JSON structure
+                reviews_list = []
                 try:
-                    # Climb up 3-5 levels to find the whole review container
-                    container = rating_el.parent
-                    for _ in range(5):
-                        if container and len(list(container.stripped_strings)) >= 5:
-                            break
-                        if container:
-                            container = container.parent
+                    # Recursive search function to find lists of review objects
+                    def find_reviews(obj):
+                        if isinstance(obj, dict):
+                            if "author" in obj and "rating" in obj and ("text" in obj or "reviewer" in obj):
+                                return [obj]
+                            # Or look for 'reviewId'
+                            if "reviewId" in obj:
+                                return [obj]
+                            # Standard places
+                            if "data" in obj:
+                                res = find_reviews(obj["data"])
+                                if res: return res
+                            if "RESPONSE" in obj:
+                                res = find_reviews(obj["RESPONSE"])
+                                if res: return res
+                            # Search all values
+                            for k, v in obj.items():
+                                if k == "reviews" and isinstance(v, list):
+                                    return v
+                                if isinstance(v, (dict, list)):
+                                    res = find_reviews(v)
+                                    if res: return res
+                        elif isinstance(obj, list):
+                            found = []
+                            for item in obj:
+                                if isinstance(item, dict):
+                                    # If it looks like a review, grab it
+                                    if "author" in item and "rating" in item:
+                                        found.append(item)
+                                    elif "reviewId" in item:
+                                        found.append(item)
+                                    else:
+                                        res = find_reviews(item)
+                                        if res: found.extend(res)
+                            if found: return found
+                        return []
                     
-                    if not container or id(container) in processed_containers:
-                        continue
+                    reviews_list = find_reviews(data)
+                except Exception as e:
+                    logger.debug(f"JSON extraction error: {e}")
+
+                if not reviews_list:
+                    console.print(f"  [dim]No more JSON reviews on page {page} for {sort_order}[/]")
+                    break
+
+                page_new_reviews = []
+                for review in reviews_list:
+                    # 5. Extract fields safely
+                    rating = review.get("rating") or review.get("value")
+                    if isinstance(rating, dict): rating = rating.get("value", rating)
+                    
+                    title = review.get("title") or review.get("summary")
+                    if isinstance(title, dict): title = title.get("text", title)
                         
-                    processed_containers.add(id(container))
-                    texts = list(container.stripped_strings)
+                    text = review.get("text") or review.get("review") or review.get("reviewText")
+                    reviewer = review.get("author") or review.get("reviewerName")
                     
-                    # Pattern usually: ['5.0', '•', 'Title', 'Review for:...', 'Body', 'more', 'Name']
-                    raw_rating = texts[0]
-                    rating = _extract_rating(raw_rating)
-                    
-                    # Find title (often the first or second string after rating, skipping bullets)
-                    title = ""
-                    body_start_idx = 1
-                    for i in range(1, min(4, len(texts))):
-                        if texts[i] not in ("•", "★") and not texts[i].startswith("Review for"):
-                            title = texts[i]
-                            body_start_idx = i + 1
-                            break
-                    
-                    # Find body and date
-                    body_parts = []
-                    review_date = ""
-                    
-                    for t in texts[body_start_idx:]:
-                        if t.startswith("Review for:"):
-                            continue
-                        if "ago" in t or re.search(r"\d{4}", t):
-                            review_date = _parse_flipkart_date(t)
-                        elif t not in ("more", "Verified Buyer", "Verified Purchase", "Helpful for") and len(t) > 3 and not re.search(r"^\d+$", t):
-                            body_parts.append(t)
-                            
-                    body = " ".join(body_parts[:2]).strip()
-                    
-                    if body and rating:
-                        all_reviews.append({
+                    try:
+                        parsed_rating = float(rating) if rating is not None else 0.0
+                    except:
+                        parsed_rating = _extract_rating(str(rating)) or 0.0
+
+                    # ID generation/extraction
+                    rev_id = review.get("id") or review.get("reviewId")
+                    if not rev_id:
+                        hash_str = f"{pid}_{title}_{text}".encode('utf-8')
+                        rev_id = hashlib.md5(hash_str).hexdigest()
+
+                    # Deduplication using global seen_ids
+                    if rev_id in seen_ids:
+                        continue
+
+                    # Date processing
+                    raw_date = review.get("created") or review.get("reviewAge", "")
+                    if str(raw_date).isdigit() and len(str(raw_date)) > 8:
+                        dt = datetime.fromtimestamp(int(str(raw_date)[:10]))
+                        parsed_date = dt.strftime("%Y-%m-%d")
+                    elif "ago" in str(raw_date).lower():
+                        parsed_date = _parse_flipkart_date(str(raw_date))
+                    elif re.match(r'\d{4}-\d{2}-\d{2}', str(raw_date)):
+                        parsed_date = str(raw_date)[:10]
+                    else:
+                        parsed_date = _parse_flipkart_date(str(raw_date))
+
+                    title_str = str(title).strip() if title else ""
+                    text_str = str(text).strip() if text else ""
+
+                    if text_str and parsed_rating:
+                        seen_ids.add(rev_id)
+                        page_new_reviews.append({
                             "product_id": product_id,
                             "product_name": product_name,
-                            "review_title": title[:100],
-                            "review_text": body[:500],
-                            "rating": rating,
-                            "review_date": review_date,
+                            "review_title": title_str[:100],
+                            "review_text": text_str[:500],
+                            "rating": parsed_rating,
+                            "review_date": parsed_date,
                             "source": "flipkart",
                         })
-                except Exception as e:
-                    logger.warning("Failed to parse a Flipkart review element: %s", e)
-                    continue
 
-            # Check for next page link
-            next_btn = soup.select_one('a._1LKTO3[href]') or soup.select_one('nav a:last-child')
-            if not next_btn:
-                console.print(f"  [yellow]No next page button. Stopping after page {page}.[/]")
+                # Check for high duplication rate
+                dups = len(reviews_list) - len(page_new_reviews)
+                console.print(f"  [dim]Retrieved {len(reviews_list)} | {dups} duplicates[/]")
+                
+                dup_ratio = dups / max(len(reviews_list), 1)
+                if dup_ratio > 0.70:
+                    consecutive_high_dup_pages += 1
+                    if consecutive_high_dup_pages >= 3:
+                        console.print(f"  [yellow]Duplication too high for {sort_order}, stopping.[/]")
+                        break
+                else:
+                    consecutive_high_dup_pages = 0
+
+                local_reviews.extend(page_new_reviews)
+
+                # Politeness
+                time.sleep(random.uniform(1.5, 3.0))
+
+            except Exception as e:
+                logger.error("Failed to scrape Flipkart API page %d (sort=%s): %s", page, sort_order, e)
+                console.print(f"  [red]Error on page {page} ({sort_order}): {e}[/]")
                 break
+                
+        return local_reviews
 
-            delay = random.uniform(2, 4)
-            time.sleep(delay)
+    # Execute all sort orders concurrently
+    with ThreadPoolExecutor(max_workers=5) as executor:
+        futures = {executor.submit(fetch_sort_order, sort): sort for sort in SORT_ORDERS}
+        for future in as_completed(futures):
+            try:
+                res = future.result()
+                all_reviews.extend(res)
+            except Exception as e:
+                console.print(f"  [red]Thread error: {e}[/]")
 
-        except Exception as e:
-            logger.error("Failed to scrape Flipkart page %d: %s", page, e)
-            console.print(f"  [red]Error on page {page}: {e}[/]")
-            break
+    # 7. Fallback behavior
+    if not all_reviews:
+        console.print("[yellow]API returned 0 reviews. Trying Playwright fallback...[/]")
+        all_reviews = scrape_with_playwright_fallback(product_url, product_id, product_name, platform="flipkart")
 
     console.print(f"[green]Scraped {len(all_reviews)} Flipkart reviews for {product_name}.[/]")
     return all_reviews

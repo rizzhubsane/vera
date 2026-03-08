@@ -16,6 +16,11 @@
     "./skills/get-statistics.js",
     "./skills/generate-report.js"
   ],
+  "integrations": {
+    "telegram": {
+      "token": "${TELEGRAM_BOT_TOKEN}"
+    }
+  },
   "heartbeats": [
     {
       "id": "weekly-voc-run",
