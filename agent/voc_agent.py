@@ -493,6 +493,12 @@ if __name__ == "__main__":
         elif cmd == "nlp":
             resp, _ = run_agent("Process NLP on all unprocessed reviews.")
             console.print(Panel(Markdown(resp), title="[bold green]Vera[/bold green]", border_style="green"))
+        elif cmd == "serve":
+            console.print("[bold green]Vera is running... listening for Telegram messages.[/bold green]")
+            # Keep the process alive
+            import time
+            while True:
+                time.sleep(60)
         else:
             console.print(f"[red]Unknown command: {cmd}[/red]")
             console.print("Usage: python -m agent.voc_agent [chat|scrape|report|weekly|nlp]")
