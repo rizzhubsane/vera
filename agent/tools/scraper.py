@@ -31,6 +31,8 @@ from dotenv import load_dotenv
 from tenacity import retry, stop_after_attempt, wait_exponential
 from rich.console import Console
 from rich.progress import Progress, SpinnerColumn, TextColumn
+from pydantic import BaseModel
+from firecrawl import Firecrawl
 
 from agent.tools.database import (
     bulk_insert_reviews,
@@ -375,319 +377,147 @@ def scrape_amazon_reviews(product_url, product_id, product_name, max_pages=10):
 
 
 # ---------------------------------------------------------------------------
-# 2. Flipkart Scraper (ScraperAPI + BeautifulSoup)
+# 2. Flipkart Scraper (Firecrawl JSON extraction)
 # ---------------------------------------------------------------------------
 
 
-def scrape_flipkart_reviews(
-    product_url, product_id, product_name, max_pages=25
-):
-    """Scrape Flipkart product reviews using Playwright network interception.
-    
-    This handles the sync/async bridge to run the async scraper in a sync context.
+class _ReviewItem(BaseModel):
+    """Schema for a single Flipkart review extracted by Firecrawl."""
+    body: str
+    date: str
+
+
+class _ReviewsPage(BaseModel):
+    """Schema for a page of Flipkart reviews extracted by Firecrawl."""
+    reviews: list[_ReviewItem]
+
+
+def scrape_flipkart_reviews_firecrawl(
+    product_url: str,
+    product_id: str,
+    product_name: str,
+    max_pages: int = 15,
+) -> list[dict]:
+    """Scrape Flipkart product reviews using Firecrawl JSON extraction.
+
+    Replaces the broken Playwright + CSS-selector Flipkart scraper.
+    Returns a list of dicts compatible with bulk_insert_reviews().
+    Extracts: review body text and review date only.
+
+    Args:
+        product_url: The Flipkart product reviews URL.
+        product_id: Identifier like 'product_a'.
+        product_name: Human-readable product name.
+        max_pages: Maximum number of pages to scrape (default 15).
+
+    Returns:
+        A list of review dicts with keys matching database.py schema.
     """
-    return asyncio.run(
-        _scrape_flipkart_async(
-            product_url, product_id, product_name, max_pages
-        )
-    )
-
-
-async def _scrape_flipkart_async(
-    product_url, product_id, product_name, max_pages
-):
-    from playwright.async_api import async_playwright
+    import requests
+    
+    api_key = os.getenv("FIRECRAWL_API_KEY")
+    if not api_key:
+        raise ValueError("FIRECRAWL_API_KEY environment variable is not set.")
 
     all_reviews = []
-    seen_ids = set()
-    intercepted_responses = []
 
-    async with async_playwright() as p:
-        browser = await p.chromium.launch(
-            headless=True,
-            args=["--no-sandbox", "--disable-dev-shm-usage"]
-        )
-        context = await browser.new_context(
-            user_agent="Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
-                       "AppleWebKit/537.36 (KHTML, like Gecko) "
-                       "Chrome/122.0.0.0 Safari/537.36",
-            viewport={"width": 1280, "height": 800},
-            locale="en-IN",
-        )
-        page = await context.new_page()
+    for page_num in range(1, max_pages + 1):
+        separator = "&" if "?" in product_url else "?"
+        page_url = f"{product_url}{separator}page={page_num}"
 
-        # --- Network interception ---
-        async def handle_response(response):
-            url = response.url
-            if (
-                "api" in url
-                and ("review" in url.lower() or "ratings" in url.lower())
-                and response.status == 200
-            ):
-                try:
-                    content_type = response.headers.get("content-type", "")
-                    if "json" in content_type:
-                        body = await response.json()
-                        intercepted_responses.append(body)
-                        console.print(
-                            f"  [dim]Intercepted API response from: "
-                            f"{url[:80]}...[/]"
-                        )
-                except Exception:
-                    pass
-
-        page.on("response", handle_response)
-
-        # --- Load the review page ---
         console.print(
-            f"[bold cyan]Loading Flipkart reviews for "
-            f"{product_name}...[/]"
+            f"  [dim][Firecrawl] Scraping Flipkart reviews "
+            f"page {page_num}/{max_pages}: {page_url[:100]}...[/]"
         )
-        await page.goto(
-            product_url,
-            wait_until="load",
-            timeout=60000,
-        )
-        await page.wait_for_timeout(5000)
 
-        # --- Paginate by clicking Next ---
-        pages_scraped = 0
+        headers = {
+            "Authorization": f"Bearer {api_key}",
+            "Content-Type": "application/json"
+        }
+        
+        payload = {
+            "url": page_url,
+            "formats": ["extract"],
+            "extract": {
+                "schema": _ReviewsPage.model_json_schema(),
+                "prompt": (
+                    "Extract all customer reviews from this Flipkart "
+                    "product reviews page. For each review extract: "
+                    "the full review body text and the date it was posted."
+                )
+            },
+            "timeout": 120000,
+            "location": {"country": "IN", "languages": ["en"]}
+        }
 
-        while pages_scraped < max_pages:
-            # Wait for review containers
-            # Flipkart uses obfuscated classes that change. We'll use multiple fallback selectors.
-            container_selectors = ["div.col.EPCmJX", "div.ZmyHeS", "div._27M-N_"]
-            found_container = False
-            for sel in container_selectors:
-                try:
-                    await page.wait_for_selector(sel, timeout=10000)
-                    found_container = True
-                    break
-                except: continue
-            
-            if not found_container:
-                console.print(f"  [yellow]No review containers found on page {pages_scraped+1}. Stopping.[/]")
-                break
-
-            # Extract from DOM
-            review_containers = await page.query_selector_all("div.col.EPCmJX, div.ZmyHeS")
-            page_reviews = []
-            
-            for el in review_containers:
-                try:
-                    # Selectors based on current Flipkart layout
-                    rating_el = await el.query_selector("div._3LWZlK, div.X1_N6m")
-                    title_el = await el.query_selector("p._2-N8zT, p.iN7S9y")
-                    text_el = await el.query_selector("div.t-ZTKy, div.ZmyHeS div, div.row div div")
-                    date_els = await el.query_selector_all("p._2sc7ZR, p.m-88wv")
-                    
-                    rating = await rating_el.inner_text() if rating_el else ""
-                    title = await title_el.inner_text() if title_el else ""
-                    text = await text_el.inner_text() if text_el else ""
-                    
-                    # Clean the "READ MORE" text often present in Flipkart reviews
-                    text = text.replace("READ MORE", "").strip()
-                    
-                    # Date is usually the last child in the info row
-                    date_text = await date_els[-1].inner_text() if date_els else ""
-
-                    if text:
-                        # ID for dedup
-                        hash_str = f"{product_id}_{title}_{text[:100]}".encode()
-                        rev_id = hashlib.md5(hash_str).hexdigest()
-                        
-                        if rev_id not in seen_ids:
-                            seen_ids.add(rev_id)
-                            page_reviews.append({
-                                "product_id": product_id,
-                                "product_name": product_name,
-                                "review_title": title.strip()[:100],
-                                "review_text": text.strip()[:500],
-                                "rating": _extract_rating(rating) or 0.0,
-                                "review_date": _parse_flipkart_date(date_text),
-                                "source": "flipkart",
-                            })
-                except Exception as e:
-                    logger.warning("Failed to parse DOM review: %s", e)
-
-            all_reviews.extend(page_reviews)
-            console.print(
-                f"  [dim]Page {pages_scraped + 1}: "
-                f"+{len(page_reviews)} reviews "
-                f"(total: {len(all_reviews)})[/]"
+        try:
+            response = requests.post(
+                "https://api.firecrawl.dev/v1/scrape",
+                headers=headers,
+                json=payload,
+                timeout=130
             )
-            pages_scraped += 1
 
-            if pages_scraped >= max_pages:
-                break
-
-            # Find and click the Next button
-            next_clicked = False
-            next_selectors = [
-                 "nav a:has-text('Next')",
-                 "a[href*='page=']:has-text('Next')",
-                 "//span[text()='Next']/parent::a",
-                 "a._1LKTO3:last-child"
-            ]
-            for selector in next_selectors:
-                try:
-                    if selector.startswith("//"):
-                        btn = await page.wait_for_selector(selector, timeout=5000)
-                    else:
-                        btn = await page.query_selector(selector)
-                    
-                    if btn:
-                        # Scroll into view to ensure clickability
-                        await btn.scroll_into_view_if_needed()
-                        await btn.click()
-                        await page.wait_for_timeout(3000)
-                        await page.wait_for_load_state("load")
-                        next_clicked = True
-                        break
-                except Exception:
-                    continue
-
-            if not next_clicked:
+            if response.status_code != 200:
                 console.print(
-                    f"  [yellow]No Next button found. "
-                    f"Stopping at page {pages_scraped}.[/]"
+                    f"  [red][Firecrawl] HTTP Error {response.status_code}: "
+                    f"{response.text}[/]"
+                )
+                break
+                
+            result = response.json()
+            if not result or not result.get('success') or 'extract' not in result.get('data', {}):
+                console.print(
+                    f"  [yellow][Firecrawl] No extracted data on page "
+                    f"{page_num}. Stopping.[/]"
                 )
                 break
 
-        await browser.close()
+            page_data = result['data']['extract']
+            page_reviews = (
+                page_data.get('reviews', []) if isinstance(page_data, dict) else []
+            )
+
+            if not page_reviews:
+                console.print(
+                    f"  [yellow][Firecrawl] No reviews on page "
+                    f"{page_num}. Stopping pagination.[/]"
+                )
+                break
+
+            for review in page_reviews:
+                body = (review.get('body') or '').strip()
+                date = (review.get('date') or '').strip()
+
+                if not body:
+                    continue
+
+                all_reviews.append({
+                    'product_id': product_id,
+                    'product_name': product_name,
+                    'review_title': '',
+                    'review_text': body,
+                    'rating': None,
+                    'review_date': _parse_flipkart_date(date) if date else '',
+                    'source': 'flipkart',
+                })
+
+            console.print(
+                f"  [dim][Firecrawl] Page {page_num}: "
+                f"+{len(page_reviews)} reviews "
+                f"(total so far: {len(all_reviews)})[/]"
+            )
+
+        except Exception as e:
+            console.print(f"  [red][Firecrawl] Error on page {page_num}: {e}[/]")
+            logger.error("Firecrawl error on page %d: %s", page_num, e)
+            break
 
     console.print(
         f"[green]Scraped {len(all_reviews)} Flipkart reviews "
-        f"for {product_name}.[/]"
+        f"for {product_name} via Firecrawl.[/]"
     )
     return all_reviews
-
-
-def _parse_intercepted_flipkart_responses(
-    responses: list,
-    seen_ids: set,
-    product_id: str,
-    product_name: str,
-) -> list[dict]:
-    """Parse intercepted JSON responses and extract review dicts."""
-    new_reviews = []
-
-    def find_reviews(obj):
-        """Recursively find review objects in nested JSON."""
-        if isinstance(obj, dict):
-            if ("rating" in obj or "value" in obj) and (
-                "text" in obj or "review" in obj or "reviewText" in obj
-            ):
-                return [obj]
-            if "reviewId" in obj or "review_id" in obj:
-                return [obj]
-            for key in ("data", "RESPONSE", "reviews", "reviewData",
-                        "reviewDetails", "paginatedData"):
-                if key in obj:
-                    result = find_reviews(obj[key])
-                    if result:
-                        return result
-            for v in obj.values():
-                if isinstance(v, (dict, list)):
-                    result = find_reviews(v)
-                    if result:
-                        return result
-        elif isinstance(obj, list):
-            found = []
-            for item in obj:
-                if isinstance(item, dict):
-                    if ("rating" in item or "value" in item) and (
-                        "text" in item
-                        or "review" in item
-                        or "reviewText" in item
-                        or "reviewId" in item
-                    ):
-                        found.append(item)
-                    else:
-                        found.extend(find_reviews(item))
-            return found
-        return []
-
-    for resp in responses:
-        reviews_list = find_reviews(resp)
-        for review in reviews_list:
-            try:
-                rating = (
-                    review.get("rating")
-                    or review.get("value")
-                    or review.get("starRating")
-                )
-                if isinstance(rating, dict):
-                    rating = rating.get("value") or rating.get("rating")
-
-                title = (
-                    review.get("title")
-                    or review.get("summary")
-                    or review.get("reviewTitle", "")
-                )
-                if isinstance(title, dict):
-                    title = title.get("text", "")
-
-                text = (
-                    review.get("text")
-                    or review.get("review")
-                    or review.get("reviewText")
-                    or review.get("description", "")
-                )
-                if isinstance(text, dict):
-                    text = text.get("text", "")
-
-                rev_id = (
-                    review.get("id")
-                    or review.get("reviewId")
-                    or review.get("review_id")
-                )
-                if not rev_id:
-                    hash_str = f"{product_id}_{title}_{text}".encode()
-                    rev_id = hashlib.md5(hash_str).hexdigest()
-
-                if rev_id in seen_ids:
-                    continue
-
-                raw_date = (
-                    review.get("created")
-                    or review.get("reviewAge")
-                    or review.get("date", "")
-                )
-                if str(raw_date).isdigit() and len(str(raw_date)) > 8:
-                    dt = datetime.fromtimestamp(int(str(raw_date)[:10]))
-                    parsed_date = dt.strftime("%Y-%m-%d")
-                elif "ago" in str(raw_date).lower():
-                    parsed_date = _parse_flipkart_date(str(raw_date))
-                elif re.match(r"\d{4}-\d{2}-\d{2}", str(raw_date)):
-                    parsed_date = str(raw_date)[:10]
-                else:
-                    parsed_date = _parse_flipkart_date(str(raw_date))
-
-                try:
-                    parsed_rating = float(rating) if rating else 0.0
-                except Exception:
-                    parsed_rating = _extract_rating(str(rating)) or 0.0
-
-                title_str = str(title).strip()[:100] if title else ""
-                text_str = str(text).strip()[:500] if text else ""
-
-                if text_str and parsed_rating:
-                    seen_ids.add(rev_id)
-                    new_reviews.append({
-                        "product_id": product_id,
-                        "product_name": product_name,
-                        "review_title": title_str,
-                        "review_text": text_str,
-                        "rating": parsed_rating,
-                        "review_date": parsed_date,
-                        "source": "flipkart",
-                    })
-            except Exception as e:
-                logger.warning("Failed to parse intercepted review: %s", e)
-                continue
-
-    return new_reviews
 
 
 # ---------------------------------------------------------------------------
@@ -847,7 +677,7 @@ def _scrape_single_product(
         final_urls = _generate_sort_variant_urls(urls)
         _print_scrape_plan(product_name, urls, final_urls, max_pages)
 
-    scrape_fn = scrape_amazon_reviews if platform == "amazon" else scrape_flipkart_reviews
+    scrape_fn = scrape_amazon_reviews if platform == "amazon" else scrape_flipkart_reviews_firecrawl
     all_reviews = []
 
     for idx, url in enumerate(final_urls, 1):

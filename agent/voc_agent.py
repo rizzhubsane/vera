@@ -99,11 +99,6 @@ TOOLS = [
         "function": {
             "name": "process_nlp",
             "description": "Classifies sentiment and themes for all unprocessed reviews.",
-            "parameters": {
-                "type": "object",
-                "properties": {},
-                "required": [],
-            },
         },
     },
     {
@@ -122,8 +117,7 @@ TOOLS = [
                     "theme": {"type": "string", "description": "Theme tag to filter by."},
                     "keyword": {"type": "string", "description": "Keyword to search in review text."},
                     "limit": {"type": "integer", "description": "Max reviews to return."},
-                },
-                "required": [],
+                }
             },
         },
     },
@@ -139,8 +133,7 @@ TOOLS = [
                         "type": "string",
                         "description": "product_a, product_b, or omit for both.",
                     },
-                },
-                "required": [],
+                }
             },
         },
     },
@@ -189,8 +182,7 @@ TOOLS = [
                 "type": "object",
                 "properties": {
                     "product_id": {"type": "string", "description": "product_a or product_b."},
-                },
-                "required": [],
+                }
             },
         },
     },
