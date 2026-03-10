@@ -132,7 +132,7 @@ def bulk_insert_reviews(reviews_list):
     return {"inserted": inserted, "duplicates": duplicates}
 
 
-def get_reviews(product_id=None, sentiment=None, theme=None, limit=None):
+def get_reviews(product_id=None, sentiment=None, theme=None, keyword=None, limit=None):
     """Query reviews with optional filters.
 
     All parameters are optional. When omitted, no filtering is applied
@@ -142,6 +142,7 @@ def get_reviews(product_id=None, sentiment=None, theme=None, limit=None):
         product_id: Filter by product identifier.
         sentiment: Filter by sentiment label (Positive/Negative/Neutral).
         theme: Filter by a theme tag (checks comma-separated themes column).
+        keyword: Substring to search for in review text/title.
         limit: Maximum number of reviews to return.
 
     Returns:
@@ -159,6 +160,11 @@ def get_reviews(product_id=None, sentiment=None, theme=None, limit=None):
     if theme:
         query += " AND (',' || themes || ',') LIKE ?"
         params.append(f"%,{theme},%")
+    if keyword:
+        query += " AND (review_text LIKE ? OR review_title LIKE ?)"
+        pattern = f"%{keyword}%"
+        params.append(pattern)
+        params.append(pattern)
     if limit:
         query += " LIMIT ?"
         params.append(limit)

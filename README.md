@@ -136,11 +136,28 @@ python agent/voc_agent.py chat
 ```bash
 python agent/voc_agent.py report
 ```
+*Note: This triggers an autonomous loop where the agent checks if it has enough data, runs NLP, and then DMs the formatted report to you.*
 
-### Run End-to-End Pipeline
+### Run End-to-End Pipeline (Automation)
+The automated pipeline follows this flow: **Scrape → NLP Classify → Report → Alert**.
 ```bash
+# Run the full cycle immediately for testing
 python scheduler/weekly_runner.py --now
+
+# Start the background scheduler (Runs every Monday at 09:00 UTC)
+python scheduler/weekly_runner.py
 ```
+
+---
+
+## Troubleshooting: Slack Notifications
+If Slack updates are not arriving:
+1. **Check Scopes**: Ensure your Slack App has the following **Bot Token Scopes** at [api.slack.com](https://api.slack.com):
+   - `chat:write` (to send messages)
+   - `im:write` (to open direct messages)
+   - `mpim:write` (for multi-person DMs, optional)
+2. **Invite Bot**: If sending to a channel, the bot must be invited (`/invite @Vera`).
+3. **Member ID**: Ensure `SLACK_USER_ID` in `.env` is your **Member ID** (find this in your Slack Profile -> More -> Copy member ID), NOT your username.
 
 ---
 

@@ -223,14 +223,9 @@ def execute_tool(tool_name, tool_input):
             return str(process_all_reviews())
 
         elif tool_name == "query_database":
-            # Separate keyword search from filtered query
-            keyword = tool_input.pop("keyword", None)
-            if keyword:
-                from agent.tools.database import search_reviews_by_keyword
-                results = search_reviews_by_keyword(keyword, tool_input.get("product_id"))
-            else:
-                results = get_reviews(**tool_input)
-            return json.dumps(results[:20], default=str)
+            # Pass all filters directly to the updated get_reviews
+            results = get_reviews(**tool_input)
+            return json.dumps(results[:30], default=str)
 
         elif tool_name == "get_statistics":
             return json.dumps(get_theme_insights(tool_input.get("product_id")), default=str)
@@ -332,9 +327,18 @@ def run_agent(user_message, conversation_history=None, max_turns=10):
                 max_tokens=2048,
             )
         except Exception as e:
-            error_msg = f"LLM API error: {str(e)}"
-            console.print(f"[red]{error_msg}[/]")
-            return error_msg, messages
+            error_msg = str(e)
+            if "tool_use_failed" in error_msg:
+                console.print(f"[yellow]LLM syntax error, retrying tool call...[/]")
+                messages.append({
+                    "role": "user", 
+                    "content": "Your previous tool call failed due to a JSON parsing error. Please try calling the tool again, ensuring you use perfect formatting."
+                })
+                continue
+                
+            error_str = f"LLM API error: {error_msg}"
+            console.print(f"[red]{error_str}[/]")
+            return error_str, messages
 
         choice = response.choices[0]
         msg = choice.message
