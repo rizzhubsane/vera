@@ -1,0 +1,10 @@
+{
+  "$schema": "https://railway.app/railway.schema.json",
+  "build": {
+    "builder": "NIXPACKS"
+  },
+  "deploy": {
+    "startCommand": "python agent/voc_agent.py serve",
+    "restartPolicyType": "ON_FAILURE"
+  }
+}
