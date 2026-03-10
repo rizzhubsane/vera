@@ -494,11 +494,42 @@ if __name__ == "__main__":
             resp, _ = run_agent("Process NLP on all unprocessed reviews.")
             console.print(Panel(Markdown(resp), title="[bold green]Vera[/bold green]", border_style="green"))
         elif cmd == "serve":
-            console.print("[bold green]Vera is running... listening for Telegram messages.[/bold green]")
-            # Keep the process alive
-            import time
-            while True:
-                time.sleep(60)
+            import telebot
+            BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
+            if not BOT_TOKEN:
+                console.print("[red]Error: TELEGRAM_BOT_TOKEN not found in environment.[/red]")
+                sys.exit(1)
+            
+            bot = telebot.TeleBot(BOT_TOKEN)
+
+            @bot.message_handler(commands=['query'])
+            def handle_query(message):
+                user_input = message.text.replace('/query', '').strip()
+                if not user_input:
+                    bot.reply_to(message, "Please provide a query after /query")
+                    return
+                response, _ = run_agent(user_input)
+                bot.reply_to(message, response)
+
+            @bot.message_handler(commands=['report'])
+            def handle_report(message):
+                bot.reply_to(message, "Generating weekly delta report... please wait.")
+                response, _ = run_agent("generate report weekly_delta")
+                bot.reply_to(message, response)
+
+            @bot.message_handler(commands=['scrape'])
+            def handle_scrape(message):
+                bot.reply_to(message, "Starting weekly delta scrape... please wait.")
+                response, _ = run_agent("scrape reviews weekly_delta")
+                bot.reply_to(message, response)
+
+            @bot.message_handler(func=lambda m: True)
+            def handle_all(message):
+                response, _ = run_agent(message.text)
+                bot.reply_to(message, response)
+
+            console.print("[bold green]Vera Telegram bot is listening...[/bold green]")
+            bot.infinity_polling()
         else:
             console.print(f"[red]Unknown command: {cmd}[/red]")
             console.print("Usage: python -m agent.voc_agent [chat|scrape|report|weekly|nlp]")
